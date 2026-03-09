@@ -1,0 +1,25 @@
+# Python dependencies for UAV detection & triangulation nodes
+# Install with: pip install -r requirements.txt
+#
+# Note: ROS 2 packages (rclpy, cv_bridge, sensor_msgs, etc.) are NOT listed here.
+# They come from the system ROS 2 installation and are available in the .venv
+# via --system-site-packages. See README.md for setup instructions.
+
+# YOLOv8 inference
+ultralytics>=8.1.0
+
+# Numeric / vision (pinned versions tested with ROS 2 Jazzy cv_bridge)
+numpy==1.26.4
+opencv-python==4.10.0.84
+
+# PyTorch (CUDA 12.x) — install matching your GPU driver
+# If you have no GPU, pip will install the CPU-only version automatically.
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Utilities
+PyYAML>=6.0
+scipy>=1.12.0
+matplotlib>=3.8.0
+pillow>=10.0.0
+psutil>=5.9.0
