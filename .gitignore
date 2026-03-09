@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.vscode/
+mrs_uav_flightforge_simulator/tmux/one_drone/generated/
+mrs_uav_flightforge_simulator/tmux/one_drone/config/generated/
+*.pt
+*.onnx
+*.engine
+.DS_Store
+Thumbs.db

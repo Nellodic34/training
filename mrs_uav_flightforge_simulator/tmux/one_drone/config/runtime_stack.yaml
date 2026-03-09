@@ -1,0 +1,7 @@
+launcher:
+  auto_start_node: triangulation  # one of: none, detection, triangulation
+  open_error_plot: true
+  plot_delay_sec: 10
+
+simulation:
+  drone_count: 3  # allowed values: 1, 2, 3
