@@ -14,7 +14,7 @@ uav1:
   type: "x500"
   spawn:
     x: 0.0
-    y: 5.0
+    y: 15.0
     z: 0.0
     heading: 0.0
 
@@ -24,7 +24,7 @@ uav2:
   type: "x500"
   spawn:
     x: 0.0
-    y: 7.0
+    y: 20.0
     z: 0.0
     heading: 0.0
 
@@ -33,8 +33,8 @@ uav3:
   frame: "x500"
   type: "x500"
   spawn:
-    x: 2.0
-    y: 6.0
+    x: 3.0
+    y: 17.5
     z: 0.0
     heading: 0.0
 
@@ -59,10 +59,10 @@ mrs_uav_flightforge_simulator:
     rgb:
 
       enabled: true
-      rate: 25.0 # [Hz] era 30
+      rate: 30.0 # [Hz] era 30
       width: 1280 # [px]
       height: 720 # [px]
-      fov: 120.32 # [deg]
+      fov: 90.32 # [deg]
 
       enable_hdr: false
       enable_temporal_aa: false
@@ -93,7 +93,7 @@ mrs_uav_flightforge_simulator:
       enabled: false
       rate: 30.0
 
-  graphics_settings: "low" # "low", "medium", "high", "epic", "cinematic"
+  graphics_settings: "high" # "low", "medium", "high", "epic", "cinematic"
 
   realtime_factor: 1.0 # [-]
 

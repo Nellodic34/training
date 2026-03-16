@@ -5,8 +5,8 @@ mrs_uav_managers:
     units: "LATLON" # {"UTM, "LATLON"}
 
     # GPS origin for the "temesvar" FlightForge world
-    # (derived from live uav1 GNSS at sim position ~0,5,0)
-    origin_x: 47.397788
+    # Aligned so that gps_baro_origin matches simulator_origin (0,0,0)
+    origin_x: 47.397743
     origin_y: 8.545594
 
     #origin_x: 48.316131

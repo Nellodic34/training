@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import csv
 import os
 import random
 from datetime import datetime
@@ -29,6 +30,10 @@ def quat_to_rotmat(x: float, y: float, z: float, w: float) -> np.ndarray:
     )
 
 
+def quat_to_yaw(x: float, y: float, z: float, w: float) -> float:
+    return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+
 def rpy_to_rotmat(roll: float, pitch: float, yaw: float) -> np.ndarray:
     cr, sr = np.cos(roll), np.sin(roll)
     cp, sp = np.cos(pitch), np.sin(pitch)
@@ -40,65 +45,67 @@ def rpy_to_rotmat(roll: float, pitch: float, yaw: float) -> np.ndarray:
     return rz @ ry @ rx
 
 
+def wrap_angle(angle_rad: float) -> float:
+    return float((angle_rad + np.pi) % (2.0 * np.pi) - np.pi)
+
+
 def stamp_to_ns(stamp) -> int:
     return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
 
-class CollectYoloDatasetNode(Node):
+class CollectHeadingDatasetNode(Node):
     def __init__(self) -> None:
-        super().__init__('collect_yolo_dataset_node')
+        super().__init__('collect_heading_dataset_node')
 
         self.declare_parameter('rgb_topic', '/uav1/rgb/image_raw')
         self.declare_parameter('camera_info_topic', '/uav1/rgb/camera_info')
         self.declare_parameter('depth_topic', '/uav1/depth/image_raw')
         self.declare_parameter('observer_odom_topic', '/uav1/hw_api/ground_truth')
-        self.declare_parameter('target_odom_topic', '/uav2/hw_api/ground_truth')
-        self.declare_parameter('output_dir', os.path.expanduser('~/dataset_uav_detector'))
-        self.declare_parameter('class_id', 0)
+        self.declare_parameter('target_odom_topic', '/uav3/hw_api/ground_truth')
+        self.declare_parameter('output_dir', os.path.expanduser('~/dataset_uav_heading'))
         self.declare_parameter('sample_every_n_frames', 5)
-        self.declare_parameter('target_class_name', 'drone')
         self.declare_parameter('target_diameter_m', 0.7)
         self.declare_parameter('bbox_scale', 1.25)
         self.declare_parameter('min_bbox_size_px', 12.0)
         self.declare_parameter('max_bbox_size_px', 700.0)
+        self.declare_parameter('crop_expand_scale', 1.2)
+        self.declare_parameter('save_full_image', False)
         self.declare_parameter('occlusion_check_enabled', True)
         self.declare_parameter('occlusion_margin_m', 0.35)
         self.declare_parameter('max_depth_age_sec', 0.2)
         self.declare_parameter('invalid_depth_is_occluded', False)
-        self.declare_parameter('save_negative_samples', True)
         self.declare_parameter('max_pose_age_sec', 0.2)
         self.declare_parameter('camera_offset_xyz_m', [0.118, 0.0, 0.016])
         self.declare_parameter('camera_rpy_deg', [0.0, 0.0, 0.0])
         self.declare_parameter('use_body_to_optical_conversion', True)
         self.declare_parameter('train_split', 0.9)
-        self.declare_parameter('write_dataset_yaml', True)
         self.declare_parameter('random_seed', 42)
         self.declare_parameter('jpeg_quality', 95)
         self.declare_parameter('debug_labeled_images', True)
-        self.declare_parameter('debug_output_dir', '/home/nello/data_test')
+        self.declare_parameter('debug_output_dir', '/home/nello/data_test_heading')
 
-        rgb_topic = self.get_parameter('rgb_topic').value
-        camera_info_topic = self.get_parameter('camera_info_topic').value
-        depth_topic = self.get_parameter('depth_topic').value
-        observer_odom_topic = self.get_parameter('observer_odom_topic').value
-        target_odom_topic = self.get_parameter('target_odom_topic').value
+        rgb_topic = str(self.get_parameter('rgb_topic').value)
+        camera_info_topic = str(self.get_parameter('camera_info_topic').value)
+        depth_topic = str(self.get_parameter('depth_topic').value)
+        observer_odom_topic = str(self.get_parameter('observer_odom_topic').value)
+        target_odom_topic = str(self.get_parameter('target_odom_topic').value)
         self.base_output_dir = str(self.get_parameter('output_dir').value)
-        self.class_id = int(self.get_parameter('class_id').value)
+
         self.sample_every_n_frames = max(1, int(self.get_parameter('sample_every_n_frames').value))
-        self.target_class_name = str(self.get_parameter('target_class_name').value)
         self.target_diameter_m = float(self.get_parameter('target_diameter_m').value)
         self.bbox_scale = float(self.get_parameter('bbox_scale').value)
         self.min_bbox_size_px = float(self.get_parameter('min_bbox_size_px').value)
         self.max_bbox_size_px = float(self.get_parameter('max_bbox_size_px').value)
+        self.crop_expand_scale = max(1.0, float(self.get_parameter('crop_expand_scale').value))
+        self.save_full_image = bool(self.get_parameter('save_full_image').value)
+
         self.occlusion_check_enabled = bool(self.get_parameter('occlusion_check_enabled').value)
         self.occlusion_margin_m = float(self.get_parameter('occlusion_margin_m').value)
         self.max_depth_age_sec = float(self.get_parameter('max_depth_age_sec').value)
         self.invalid_depth_is_occluded = bool(self.get_parameter('invalid_depth_is_occluded').value)
-        self.save_negative_samples = bool(self.get_parameter('save_negative_samples').value)
         self.max_pose_age_sec = float(self.get_parameter('max_pose_age_sec').value)
         self.use_body_to_optical = bool(self.get_parameter('use_body_to_optical_conversion').value)
         self.train_split = float(self.get_parameter('train_split').value)
-        self.write_dataset_yaml = bool(self.get_parameter('write_dataset_yaml').value)
         self.rng = random.Random(int(self.get_parameter('random_seed').value))
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
         self.debug_labeled_images = bool(self.get_parameter('debug_labeled_images').value)
@@ -122,8 +129,6 @@ class CollectYoloDatasetNode(Node):
         self.bridge = CvBridge()
         self.frame_count = 0
         self.saved_count = 0
-        self.positive_count = 0
-        self.negative_count = 0
         self.skipped_count = 0
         self.occluded_count = 0
         self.depth_stale_count = 0
@@ -136,18 +141,21 @@ class CollectYoloDatasetNode(Node):
         self.latest_depth: Optional[np.ndarray] = None
         self.latest_depth_stamp_ns: Optional[int] = None
 
-        self.images_train_dir = os.path.join(self.output_dir, 'images', 'train')
-        self.images_val_dir = os.path.join(self.output_dir, 'images', 'val')
+        self.crops_train_dir = os.path.join(self.output_dir, 'crops', 'train')
+        self.crops_val_dir = os.path.join(self.output_dir, 'crops', 'val')
         self.labels_train_dir = os.path.join(self.output_dir, 'labels', 'train')
         self.labels_val_dir = os.path.join(self.output_dir, 'labels', 'val')
+        self.images_train_dir = os.path.join(self.output_dir, 'images', 'train')
+        self.images_val_dir = os.path.join(self.output_dir, 'images', 'val')
 
-        for path in [
-            self.images_train_dir,
-            self.images_val_dir,
-            self.labels_train_dir,
-            self.labels_val_dir,
-        ]:
+        paths = [self.crops_train_dir, self.crops_val_dir, self.labels_train_dir, self.labels_val_dir]
+        if self.save_full_image:
+            paths += [self.images_train_dir, self.images_val_dir]
+        for path in paths:
             os.makedirs(path, exist_ok=True)
+
+        self.metadata_path = os.path.join(self.output_dir, 'metadata.csv')
+        self._init_metadata_csv()
 
         if self.debug_labeled_images:
             self.debug_train_dir = os.path.join(self.debug_output_dir, 'train')
@@ -157,9 +165,6 @@ class CollectYoloDatasetNode(Node):
         else:
             self.debug_train_dir = ''
             self.debug_val_dir = ''
-
-        if self.write_dataset_yaml:
-            self.write_yolo_dataset_yaml()
 
         self.create_subscription(Image, rgb_topic, self.rgb_callback, 10)
         self.create_subscription(CameraInfo, camera_info_topic, self.camera_info_callback, 10)
@@ -173,24 +178,35 @@ class CollectYoloDatasetNode(Node):
         self.get_logger().info(f'Listening observer GT: {observer_odom_topic}')
         self.get_logger().info(f'Listening target GT: {target_odom_topic}')
         self.get_logger().info(f'Run id: {self.run_id}')
-        self.get_logger().info(f'Saving dataset to: {self.output_dir} (base: {self.base_output_dir})')
+        self.get_logger().info(f'Saving heading dataset to: {self.output_dir} (base: {self.base_output_dir})')
         if self.debug_labeled_images:
             self.get_logger().info(f'Saving debug labeled images to: {self.debug_output_dir} (base: {self.base_debug_output_dir})')
 
-    def write_yolo_dataset_yaml(self) -> None:
-        dataset_yaml_path = os.path.join(self.output_dir, 'dataset.yaml')
-        names = [f'class_{i}' for i in range(self.class_id + 1)]
-        names[self.class_id] = self.target_class_name
-        names_str = ', '.join(names)
-        content = (
-            f'path: {self.output_dir}\n'
-            'train: images/train\n'
-            'val: images/val\n'
-            f'nc: {self.class_id + 1}\n'
-            f'names: [{names_str}]\n'
-        )
-        with open(dataset_yaml_path, 'w', encoding='utf-8') as f:
-            f.write(content)
+    def _init_metadata_csv(self) -> None:
+        os.makedirs(self.output_dir, exist_ok=True)
+        with open(self.metadata_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([
+                'sample_id',
+                'split',
+                'stamp_ns',
+                'crop_relpath',
+                'label_relpath',
+                'image_relpath',
+                'bbox_x1',
+                'bbox_y1',
+                'bbox_x2',
+                'bbox_y2',
+                'bbox_cx',
+                'bbox_cy',
+                'bbox_w',
+                'bbox_h',
+                'yaw_world_rad',
+                'yaw_relative_world_rad',
+                'yaw_camera_rad',
+                'sin_yaw_camera',
+                'cos_yaw_camera',
+            ])
 
     def camera_info_callback(self, msg: CameraInfo) -> None:
         self.latest_camera_info = msg
@@ -250,7 +266,7 @@ class CollectYoloDatasetNode(Node):
 
         return (u, v, depth, fx)
 
-    def center_to_yolo_bbox(
+    def center_to_bbox_px(
         self,
         u: float,
         v: float,
@@ -258,26 +274,47 @@ class CollectYoloDatasetNode(Node):
         fx: float,
         image_width: int,
         image_height: int,
-    ) -> Optional[Tuple[float, float, float, float]]:
+    ) -> Optional[Tuple[int, int, int, int]]:
         bbox_size_px = self.bbox_scale * fx * self.target_diameter_m / depth
         bbox_size_px = max(self.min_bbox_size_px, min(self.max_bbox_size_px, bbox_size_px))
         half = 0.5 * bbox_size_px
 
-        x1 = max(0.0, u - half)
-        y1 = max(0.0, v - half)
-        x2 = min(float(image_width - 1), u + half)
-        y2 = min(float(image_height - 1), v + half)
+        x1 = int(max(0.0, u - half))
+        y1 = int(max(0.0, v - half))
+        x2 = int(min(float(image_width - 1), u + half))
+        y2 = int(min(float(image_height - 1), v + half))
 
         w_px = x2 - x1
         h_px = y2 - y1
-        if w_px <= 2.0 or h_px <= 2.0:
+        if w_px <= 2 or h_px <= 2:
             return None
 
-        xc = (x1 + x2) * 0.5 / float(image_width)
-        yc = (y1 + y2) * 0.5 / float(image_height)
-        wn = w_px / float(image_width)
-        hn = h_px / float(image_height)
-        return (xc, yc, wn, hn)
+        return (x1, y1, x2, y2)
+
+    def expand_bbox(
+        self,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        image_width: int,
+        image_height: int,
+    ) -> Tuple[int, int, int, int]:
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        w = (x2 - x1) * self.crop_expand_scale
+        h = (y2 - y1) * self.crop_expand_scale
+
+        ex1 = int(max(0, round(cx - 0.5 * w)))
+        ey1 = int(max(0, round(cy - 0.5 * h)))
+        ex2 = int(min(image_width - 1, round(cx + 0.5 * w)))
+        ey2 = int(min(image_height - 1, round(cy + 0.5 * h)))
+
+        if ex2 <= ex1:
+            ex2 = min(image_width - 1, ex1 + 1)
+        if ey2 <= ey1:
+            ey2 = min(image_height - 1, ey1 + 1)
+        return ex1, ey1, ex2, ey2
 
     def depth_at_pixel_m(self, u: float, v: float) -> Optional[float]:
         if self.latest_depth is None:
@@ -324,19 +361,74 @@ class CollectYoloDatasetNode(Node):
 
         return (depth_m + self.occlusion_margin_m) < target_depth_m
 
-    def project_target_bbox(
+    def compute_heading_labels(self, observer_odom: Odometry, target_odom: Odometry) -> Tuple[float, float, float, float, float]:
+        obs_q = observer_odom.pose.pose.orientation
+        tgt_q = target_odom.pose.pose.orientation
+
+        yaw_obs_world = quat_to_yaw(obs_q.x, obs_q.y, obs_q.z, obs_q.w)
+        yaw_tgt_world = quat_to_yaw(tgt_q.x, tgt_q.y, tgt_q.z, tgt_q.w)
+        yaw_relative_world = wrap_angle(yaw_tgt_world - yaw_obs_world)
+
+        r_wb_obs = quat_to_rotmat(obs_q.x, obs_q.y, obs_q.z, obs_q.w)
+        r_bw_obs = r_wb_obs.T
+        r_wb_tgt = quat_to_rotmat(tgt_q.x, tgt_q.y, tgt_q.z, tgt_q.w)
+
+        forward_world = r_wb_tgt[:, 0]
+        forward_body_obs = r_bw_obs @ forward_world
+        forward_cam = self.r_bc.T @ forward_body_obs
+
+        if self.use_body_to_optical:
+            forward_opt = np.array([-forward_cam[1], -forward_cam[2], forward_cam[0]], dtype=np.float64)
+        else:
+            forward_opt = forward_cam
+
+        yaw_camera = wrap_angle(float(np.arctan2(forward_opt[0], forward_opt[2])))
+        return yaw_tgt_world, yaw_relative_world, yaw_camera, float(np.sin(yaw_camera)), float(np.cos(yaw_camera))
+
+    def append_metadata_row(
         self,
-        camera_info: CameraInfo,
-        observer_odom: Odometry,
-        target_odom: Odometry,
-        image_width: int,
-        image_height: int,
-    ) -> Optional[Tuple[float, float, float, float]]:
-        projection = self.project_target_center(camera_info, observer_odom, target_odom)
-        if projection is None:
-            return None
-        u, v, depth, fx = projection
-        return self.center_to_yolo_bbox(u, v, depth, fx, image_width, image_height)
+        sample_id: str,
+        split: str,
+        stamp_ns: int,
+        crop_relpath: str,
+        label_relpath: str,
+        image_relpath: str,
+        bbox_px: Tuple[int, int, int, int],
+        yaw_world: float,
+        yaw_rel_world: float,
+        yaw_cam: float,
+        sin_yaw_cam: float,
+        cos_yaw_cam: float,
+    ) -> None:
+        x1, y1, x2, y2 = bbox_px
+        bw = x2 - x1
+        bh = y2 - y1
+        bcx = x1 + 0.5 * bw
+        bcy = y1 + 0.5 * bh
+
+        with open(self.metadata_path, 'a', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([
+                sample_id,
+                split,
+                stamp_ns,
+                crop_relpath,
+                label_relpath,
+                image_relpath,
+                x1,
+                y1,
+                x2,
+                y2,
+                bcx,
+                bcy,
+                bw,
+                bh,
+                yaw_world,
+                yaw_rel_world,
+                yaw_cam,
+                sin_yaw_cam,
+                cos_yaw_cam,
+            ])
 
     def rgb_callback(self, rgb_msg: Image) -> None:
         self.frame_count += 1
@@ -365,89 +457,101 @@ class CollectYoloDatasetNode(Node):
             observer_odom=self.latest_observer_odom,
             target_odom=self.latest_target_odom,
         )
-
         if projection is None:
-            yolo_box = None
-        else:
-            u, v, target_depth_m, fx = projection
-            yolo_box = self.center_to_yolo_bbox(u, v, target_depth_m, fx, width, height)
-            if yolo_box is not None and self.is_target_occluded(image_stamp_ns, u, v, target_depth_m):
-                yolo_box = None
-                self.occluded_count += 1
-
-        if yolo_box is None and not self.save_negative_samples:
             self.skipped_count += 1
             return
 
+        u, v, target_depth_m, fx = projection
+        bbox = self.center_to_bbox_px(u, v, target_depth_m, fx, width, height)
+        if bbox is None:
+            self.skipped_count += 1
+            return
+
+        if self.is_target_occluded(image_stamp_ns, u, v, target_depth_m):
+            self.occluded_count += 1
+            self.skipped_count += 1
+            return
+
+        yaw_world, yaw_rel_world, yaw_cam, sin_yaw_cam, cos_yaw_cam = self.compute_heading_labels(
+            observer_odom=self.latest_observer_odom,
+            target_odom=self.latest_target_odom,
+        )
+
         split = 'train' if self.rng.random() < self.train_split else 'val'
-        image_dir = self.images_train_dir if split == 'train' else self.images_val_dir
+        crop_dir = self.crops_train_dir if split == 'train' else self.crops_val_dir
         label_dir = self.labels_train_dir if split == 'train' else self.labels_val_dir
+        image_dir = self.images_train_dir if split == 'train' else self.images_val_dir
 
-        stamp_ns = image_stamp_ns
-        sample_id = f'{stamp_ns}_{self.saved_count:07d}'
+        sample_id = f'{image_stamp_ns}_{self.saved_count:07d}'
 
-        image_path = os.path.join(image_dir, f'{sample_id}.jpg')
+        x1, y1, x2, y2 = bbox
+        ex1, ey1, ex2, ey2 = self.expand_bbox(x1, y1, x2, y2, width, height)
+        crop = rgb[ey1:ey2, ex1:ex2]
+        if crop.size == 0:
+            self.skipped_count += 1
+            return
+
+        crop_path = os.path.join(crop_dir, f'{sample_id}.jpg')
         label_path = os.path.join(label_dir, f'{sample_id}.txt')
+        image_path = os.path.join(image_dir, f'{sample_id}.jpg') if self.save_full_image else ''
 
-        cv2.imwrite(image_path, rgb, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+        ok = cv2.imwrite(crop_path, crop, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+        if not ok:
+            self.skipped_count += 1
+            return
 
         with open(label_path, 'w', encoding='utf-8') as f:
-            if yolo_box is not None:
-                xc, yc, wn, hn = yolo_box
-                f.write(f'{self.class_id} {xc:.6f} {yc:.6f} {wn:.6f} {hn:.6f}\n')
+            f.write(
+                f'{yaw_cam:.8f} {sin_yaw_cam:.8f} {cos_yaw_cam:.8f} {yaw_world:.8f} {yaw_rel_world:.8f}\n'
+            )
+
+        if self.save_full_image:
+            cv2.imwrite(image_path, rgb, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
 
         if self.debug_labeled_images:
             debug_img = rgb.copy()
-            if yolo_box is not None:
-                xc, yc, wn, hn = yolo_box
-                x1 = int((xc - wn / 2.0) * width)
-                y1 = int((yc - hn / 2.0) * height)
-                x2 = int((xc + wn / 2.0) * width)
-                y2 = int((yc + hn / 2.0) * height)
-                x1 = max(0, min(width - 1, x1))
-                y1 = max(0, min(height - 1, y1))
-                x2 = max(0, min(width - 1, x2))
-                y2 = max(0, min(height - 1, y2))
-                cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(
-                    debug_img,
-                    f'{self.target_class_name}:{self.class_id}',
-                    (x1, max(20, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-            else:
-                cv2.putText(
-                    debug_img,
-                    'NEGATIVE',
-                    (20, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
-                    (0, 0, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-
+            cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.rectangle(debug_img, (ex1, ey1), (ex2, ey2), (255, 255, 0), 2)
+            cv2.putText(
+                debug_img,
+                f'yaw_cam={yaw_cam:.2f} rad',
+                (x1, max(22, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
             debug_dir = self.debug_train_dir if split == 'train' else self.debug_val_dir
             debug_path = os.path.join(debug_dir, f'{sample_id}.jpg')
             cv2.imwrite(debug_path, debug_img, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
 
+        crop_relpath = os.path.relpath(crop_path, self.output_dir)
+        label_relpath = os.path.relpath(label_path, self.output_dir)
+        image_relpath = os.path.relpath(image_path, self.output_dir) if self.save_full_image else ''
+
+        self.append_metadata_row(
+            sample_id=sample_id,
+            split=split,
+            stamp_ns=image_stamp_ns,
+            crop_relpath=crop_relpath,
+            label_relpath=label_relpath,
+            image_relpath=image_relpath,
+            bbox_px=(x1, y1, x2, y2),
+            yaw_world=yaw_world,
+            yaw_rel_world=yaw_rel_world,
+            yaw_cam=yaw_cam,
+            sin_yaw_cam=sin_yaw_cam,
+            cos_yaw_cam=cos_yaw_cam,
+        )
+
         self.saved_count += 1
-        if yolo_box is None:
-            self.negative_count += 1
-        else:
-            self.positive_count += 1
 
         if self.saved_count % 50 == 0 or self.frame_count % 200 == 0:
             self.get_logger().info(
-                'Saved=%d (pos=%d, neg=%d, skipped=%d, occluded=%d, depth_stale=%d, depth_invalid=%d, last_split=%s)'
+                'Saved=%d (skipped=%d, occluded=%d, depth_stale=%d, depth_invalid=%d, last_split=%s)'
                 % (
                     self.saved_count,
-                    self.positive_count,
-                    self.negative_count,
                     self.skipped_count,
                     self.occluded_count,
                     self.depth_stale_count,
@@ -459,7 +563,7 @@ class CollectYoloDatasetNode(Node):
 
 def main() -> None:
     rclpy.init()
-    node = CollectYoloDatasetNode()
+    node = CollectHeadingDatasetNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

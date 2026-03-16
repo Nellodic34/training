@@ -3,6 +3,7 @@
 from copy import deepcopy
 import os
 from pathlib import Path
+import shlex
 import sys
 
 import yaml
@@ -21,7 +22,140 @@ def get_runtime_uav_mapping(drone_count: int):
     raise ValueError('simulation.drone_count must be 1, 2 or 3')
 
 
-def build_session(root_dir: Path, enabled_uavs):
+def shell_quote(value) -> str:
+    return shlex.quote(str(value))
+
+
+def build_dataset_tool_command(
+    workspace_dir: Path,
+    ros_setup: str,
+    local_setup: str,
+    venv_activate: str,
+    python_bin: str,
+    script_path: str,
+    intro_message: str,
+    ros_parameters=None,
+):
+    ros_parameters = ros_parameters or {}
+    ros_args = ''
+    if ros_parameters:
+        ros_args = ' --ros-args ' + ' '.join(
+            f"-p {shell_quote(f'{name}:={value}')}" for name, value in ros_parameters.items()
+        )
+
+    return (
+        ' && '.join(
+            [
+                f'cd {shell_quote(workspace_dir)}',
+                f'source {shell_quote(ros_setup)}',
+                f'source {shell_quote(local_setup)}',
+                f'source {shell_quote(venv_activate)}',
+                f'echo {shell_quote(intro_message)}',
+                f'{shell_quote(python_bin)} {shell_quote(script_path)}{ros_args}',
+            ]
+        )
+        + '; exec bash'
+    )
+
+
+def build_ready_command(
+    workspace_dir: Path,
+    ros_setup: str,
+    local_setup: str,
+    venv_activate: str,
+    detection_script: str,
+    triangulation_script: str,
+):
+    return (
+        ' && '.join(
+            [
+                f'cd {shell_quote(workspace_dir)}',
+                f'source {shell_quote(ros_setup)}',
+                f'source {shell_quote(local_setup)}',
+                f'source {shell_quote(venv_activate)}',
+                "echo 'Environment ready for detection and triangulation nodes.'",
+                f"echo 'Single-view detection: python {detection_script}'",
+                f"echo 'Multi-view triangulation: python {triangulation_script}'",
+            ]
+        )
+        + '; exec bash'
+    )
+
+
+def build_auto_start_window(node_cfg):
+    workspace_dir = Path(node_cfg['workspace_dir'])
+    ros_setup = node_cfg['ros_setup']
+    local_setup = node_cfg['local_setup']
+    venv_activate = node_cfg['venv_activate']
+    python_bin = node_cfg['python_bin']
+    detection_script = node_cfg['detection_script']
+    triangulation_script = node_cfg['triangulation_script']
+    auto_start_node = node_cfg['auto_start_node']
+
+    if auto_start_node == 'triangulation':
+        triangulation_params = {
+            'observer1_name': node_cfg['observer1_name'],
+            'observer2_name': node_cfg['observer2_name'],
+            'target_name': node_cfg['target_name'],
+            'kf_process_noise_pos': node_cfg['kf_process_noise_pos'],
+            'kf_process_noise_vel': node_cfg['kf_process_noise_vel'],
+            'kf_measurement_noise': node_cfg['kf_measurement_noise'],
+            'kf_initial_covariance': node_cfg['kf_initial_covariance'],
+        }
+        return {
+            'triangulation': {
+                'layout': 'tiled',
+                'panes': [
+                    build_dataset_tool_command(
+                        workspace_dir,
+                        ros_setup,
+                        local_setup,
+                        venv_activate,
+                        python_bin,
+                        triangulation_script,
+                        'Starting multi-view triangulation node...',
+                        triangulation_params,
+                    )
+                ],
+            }
+        }
+
+    if auto_start_node == 'detection':
+        return {
+            'detection': {
+                'layout': 'tiled',
+                'panes': [
+                    build_dataset_tool_command(
+                        workspace_dir,
+                        ros_setup,
+                        local_setup,
+                        venv_activate,
+                        python_bin,
+                        detection_script,
+                        'Starting single-view detection node...',
+                    )
+                ],
+            }
+        }
+
+    return {
+        'perception_ready': {
+            'layout': 'tiled',
+            'panes': [
+                build_ready_command(
+                    workspace_dir,
+                    ros_setup,
+                    local_setup,
+                    venv_activate,
+                    detection_script,
+                    triangulation_script,
+                )
+            ],
+        }
+    }
+
+
+def build_session(root_dir: Path, enabled_uavs, flightforge_dir: str, flightforge_cmd: str, node_cfg):
     session = {
         'root': str(root_dir),
         'name': 'simulation',
@@ -39,6 +173,14 @@ def build_session(root_dir: Path, enabled_uavs):
         'windows': [],
     }
 
+    session['windows'].append(
+        {
+            'flightforge': {
+                'layout': 'tiled',
+                'panes': [f'cd {flightforge_dir} && {flightforge_cmd}'],
+            }
+        }
+    )
     session['windows'].append({'router': {'layout': 'tiled', 'panes': ['ros2 run rmw_zenoh_cpp rmw_zenohd']}})
     session['windows'].append(
         {
@@ -126,6 +268,7 @@ def build_session(root_dir: Path, enabled_uavs):
             }
         }
     )
+    session['windows'].append(build_auto_start_window(node_cfg))
 
     session['windows'].append(
         {
@@ -166,6 +309,7 @@ def main() -> int:
     runtime_config = yaml.safe_load(runtime_config_path.read_text(encoding='utf-8')) or {}
     launcher_cfg = runtime_config.get('launcher', {})
     simulation_cfg = runtime_config.get('simulation', {})
+    ekf_cfg = runtime_config.get('ekf', {})
 
     auto_start_node = str(launcher_cfg.get('auto_start_node', 'triangulation')).strip().lower()
     if auto_start_node not in {'none', 'detection', 'triangulation'}:
@@ -173,6 +317,31 @@ def main() -> int:
 
     open_error_plot = bool(launcher_cfg.get('open_error_plot', True))
     plot_delay_sec = int(launcher_cfg.get('plot_delay_sec', 10))
+
+    uav_roles_cfg = runtime_config.get('uav_roles', {})
+    observer1_name = str(uav_roles_cfg.get('observer1', 'uav1'))
+    observer2_name = str(uav_roles_cfg.get('observer2', 'uav2'))
+    target_name = str(uav_roles_cfg.get('target', 'uav3'))
+    kf_process_noise_pos = float(ekf_cfg.get('kf_process_noise_pos', 0.5))
+    kf_process_noise_vel = float(ekf_cfg.get('kf_process_noise_vel', 1.0))
+    kf_measurement_noise = float(ekf_cfg.get('kf_measurement_noise', 0.05))
+    kf_initial_covariance = float(ekf_cfg.get('kf_initial_covariance', 10.0))
+
+    flightforge_dir = os.environ.get('FLIGHTFORGE_DIR', str(Path.home() / 'Pliska_FlightForge'))
+    flightforge_cmd = os.environ.get('FLIGHTFORGE_CMD', './mrs_flight_forge.sh')
+    workspace_dir = script_dir.parent.parent
+    ros_setup = os.environ.get('ROS_SETUP', '/opt/ros/jazzy/setup.bash')
+    local_setup = os.environ.get('LOCAL_SETUP', str(workspace_dir / 'local_setup.bash'))
+    venv_activate = os.environ.get('VENV_ACTIVATE', str(workspace_dir / '.venv/bin/activate'))
+    python_bin = os.environ.get('PYTHON_BIN', str(workspace_dir / '.venv/bin/python'))
+    detection_script = os.environ.get(
+        'DETECTION_SCRIPT',
+        str(script_dir / 'dataset_tools/test_yolov8_realtime_node.py'),
+    )
+    triangulation_script = os.environ.get(
+        'TRIANGULATION_SCRIPT',
+        str(script_dir / 'dataset_tools/test_yolov8_multiview_triangulation_node.py'),
+    )
 
     drone_count = int(simulation_cfg.get('drone_count', 3))
     if drone_count not in {1, 2, 3}:
@@ -197,7 +366,25 @@ def main() -> int:
     network_runtime = deepcopy(network_base)
     network_runtime.setdefault('network', {})['robot_names'] = enabled_uavs
 
-    session_runtime = build_session(script_dir, enabled_uavs)
+    node_cfg = {
+        'workspace_dir': workspace_dir,
+        'ros_setup': ros_setup,
+        'local_setup': local_setup,
+        'venv_activate': venv_activate,
+        'python_bin': python_bin,
+        'detection_script': detection_script,
+        'triangulation_script': triangulation_script,
+        'auto_start_node': auto_start_node,
+        'observer1_name': observer1_name,
+        'observer2_name': observer2_name,
+        'target_name': target_name,
+        'kf_process_noise_pos': kf_process_noise_pos,
+        'kf_process_noise_vel': kf_process_noise_vel,
+        'kf_measurement_noise': kf_measurement_noise,
+        'kf_initial_covariance': kf_initial_covariance,
+    }
+
+    session_runtime = build_session(script_dir, enabled_uavs, flightforge_dir, flightforge_cmd, node_cfg)
 
     simulator_runtime_path = generated_config_dir / 'simulator.runtime.yaml'
     network_runtime_path = generated_config_dir / 'network_config.runtime.yaml'
@@ -216,6 +403,13 @@ def main() -> int:
                 f"OPEN_ERROR_PLOT='{'true' if open_error_plot else 'false'}'",
                 f"PLOT_DELAY_SEC='{plot_delay_sec}'",
                 f"DRONE_COUNT='{drone_count}'",
+                f"OBSERVER1_NAME='{observer1_name}'",
+                f"OBSERVER2_NAME='{observer2_name}'",
+                f"TARGET_NAME='{target_name}'",
+                f"KF_PROCESS_NOISE_POS='{kf_process_noise_pos}'",
+                f"KF_PROCESS_NOISE_VEL='{kf_process_noise_vel}'",
+                f"KF_MEASUREMENT_NOISE='{kf_measurement_noise}'",
+                f"KF_INITIAL_COVARIANCE='{kf_initial_covariance}'",
             ]
         )
         + '\n',

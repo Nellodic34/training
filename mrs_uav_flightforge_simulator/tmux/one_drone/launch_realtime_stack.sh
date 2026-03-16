@@ -75,7 +75,7 @@ if [ ! -f "$TRIANGULATION_SCRIPT" ]; then
   exit 1
 fi
 
-RUNTIME_STACK_CONFIG_PATH="$RUNTIME_STACK_CONFIG" "$PYTHON_BIN" "$RUNTIME_STACK_GENERATOR"
+RUNTIME_STACK_CONFIG_PATH="$RUNTIME_STACK_CONFIG" FLIGHTFORGE_DIR="$FLIGHTFORGE_DIR" FLIGHTFORGE_CMD="$FLIGHTFORGE_CMD" ROS_SETUP="$ROS_SETUP" LOCAL_SETUP="$LOCAL_SETUP" VENV_ACTIVATE="$VENV_ACTIVATE" PYTHON_BIN="$PYTHON_BIN" DETECTION_SCRIPT="$DETECTION_SCRIPT" TRIANGULATION_SCRIPT="$TRIANGULATION_SCRIPT" "$PYTHON_BIN" "$RUNTIME_STACK_GENERATOR"
 
 RUNTIME_ENV_PATH="$SCRIPT_DIR/generated/runtime.env"
 if [ ! -f "$RUNTIME_ENV_PATH" ]; then
@@ -86,23 +86,19 @@ fi
 # shellcheck disable=SC1090
 source "$RUNTIME_ENV_PATH"
 
-gnome-terminal --title="FlightForge" -- bash -lc "cd '$FLIGHTFORGE_DIR' && $FLIGHTFORGE_CMD"
-
-sleep 2
-
 gnome-terminal --title="MRS one_drone start" -- bash -lc "cd '$SCRIPT_DIR' && export SESSION_YML_PATH='$GENERATED_SESSION_YML_PATH' && ./start.sh"
 
 sleep 2
 
 case "$AUTO_START_NODE" in
   triangulation)
-    gnome-terminal --title="YOLO triangulation" -- bash -lc "cd '$WORKSPACE_DIR' && source '$ROS_SETUP' && source '$LOCAL_SETUP' && source '$VENV_ACTIVATE' && echo 'Avvio automatico nodo multi-view triangulation...' && python '$TRIANGULATION_SCRIPT'; exec bash"
+    echo "Nodo multi-view triangulation aggiunto alla finestra tmux 'triangulation'."
     ;;
   detection)
-    gnome-terminal --title="YOLO detection" -- bash -lc "cd '$WORKSPACE_DIR' && source '$ROS_SETUP' && source '$LOCAL_SETUP' && source '$VENV_ACTIVATE' && echo 'Avvio automatico nodo single-view detection...' && python '$DETECTION_SCRIPT'; exec bash"
+    echo "Nodo single-view detection aggiunto alla finestra tmux 'detection'."
     ;;
   none)
-    gnome-terminal --title="YOLO nodes READY" -- bash -lc "cd '$WORKSPACE_DIR' && source '$ROS_SETUP' && source '$LOCAL_SETUP' && source '$VENV_ACTIVATE' && echo 'Ambiente pronto per i nodi detection.' && echo 'Single-view:' && echo 'python $DETECTION_SCRIPT' && echo '' && echo 'Multi-view triangulation:' && echo 'python $TRIANGULATION_SCRIPT' && exec bash"
+    echo "Finestra tmux 'perception_ready' aggiunta con l'ambiente pronto per i nodi detection e triangulation."
     ;;
   *)
     echo "Errore: AUTO_START_NODE non valido: $AUTO_START_NODE"
@@ -116,4 +112,4 @@ if [ "$OPEN_ERROR_PLOT" = "true" ]; then
   gnome-terminal --title="Target error plot" -- bash -lc "cd '$WORKSPACE_DIR' && source '$ROS_SETUP' && source '$LOCAL_SETUP' && echo 'Apro rqt_plot sull errore di posizione del target...' && $RQT_PLOT_CMD"
 fi
 
-echo "Launcher completato. drone_count=$DRONE_COUNT, auto_start_node=$AUTO_START_NODE, open_error_plot=$OPEN_ERROR_PLOT, plot_delay_sec=$PLOT_DELAY_SEC"
+echo "Launcher completato. drone_count=$DRONE_COUNT, auto_start_node=$AUTO_START_NODE, open_error_plot=$OPEN_ERROR_PLOT, plot_delay_sec=$PLOT_DELAY_SEC, observer1=$OBSERVER1_NAME, observer2=$OBSERVER2_NAME, target=$TARGET_NAME"

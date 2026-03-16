@@ -9,10 +9,14 @@ import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from geometry_msgs.msg import PoseStamped, Vector3Stamped
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Point, PoseStamped, Vector3Stamped
+from nav_msgs.msg import Odometry, Path
+from visualization_msgs.msg import Marker, MarkerArray
+from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
+from tf2_ros import Buffer, TransformListener
 from ultralytics import YOLO
 
 
@@ -31,17 +35,6 @@ def quat_to_rotmat(x: float, y: float, z: float, w: float) -> np.ndarray:
     )
 
 
-def rpy_to_rotmat(roll: float, pitch: float, yaw: float) -> np.ndarray:
-    cr, sr = np.cos(roll), np.sin(roll)
-    cp, sp = np.cos(pitch), np.sin(pitch)
-    cy, sy = np.cos(yaw), np.sin(yaw)
-
-    rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float64)
-    ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float64)
-    rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-    return rz @ ry @ rx
-
-
 def stamp_to_ns(stamp) -> int:
     return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
@@ -51,10 +44,6 @@ def normalize(vec: np.ndarray) -> np.ndarray:
     if norm <= 1e-9:
         raise ValueError('Cannot normalize near-zero vector')
     return vec / norm
-
-
-def optical_to_camera_ray(ray_optical: np.ndarray) -> np.ndarray:
-    return np.array([ray_optical[2], -ray_optical[0], -ray_optical[1]], dtype=np.float64)
 
 
 def triangulate_midpoint(
@@ -86,6 +75,57 @@ def triangulate_midpoint(
 
 
 @dataclass
+class StateCov:
+    """State and covariance pair (equivalent to mrs_lib::LKF::statecov_t)."""
+
+    x: np.ndarray  # state vector  (n,)
+    P: np.ndarray  # covariance     (n, n)
+
+
+class LinearKalmanFilter:
+
+
+    def __init__(self, A: np.ndarray, B: np.ndarray, H: np.ndarray) -> None:
+        self.A = A.copy()
+        self.B = B.copy()
+        self.H = H.copy()
+        self.n = A.shape[0]
+
+    def predict(self, sc: StateCov, u: np.ndarray, Q: np.ndarray, dt: float) -> StateCov:
+        """Prediction step.  Q is scaled by dt (same as mrs_lib::LKF::predict)."""
+        x_pred = self.A @ sc.x + self.B @ u
+        P_pred = self.A @ sc.P @ self.A.T + Q * dt
+        return StateCov(x=x_pred, P=P_pred)
+
+    def correct(self, sc: StateCov, z: np.ndarray, R: np.ndarray) -> StateCov:
+        """Correction (update) step."""
+        y = z - self.H @ sc.x
+        S = self.H @ sc.P @ self.H.T + R
+        K = sc.P @ self.H.T @ np.linalg.inv(S)
+        x_new = sc.x + K @ y
+        P_new = (np.eye(self.n) - K @ self.H) @ sc.P
+        return StateCov(x=x_new, P=P_new)
+
+
+def build_transition_matrix(dt: float) -> np.ndarray:
+    """Build 9x9 constant-acceleration (CA) transition matrix A(dt).
+
+    State layout: [px, py, pz, vx, vy, vz, ax, ay, az]
+    """
+    A = np.eye(9, dtype=np.float64)
+    dt2 = 0.5 * dt * dt
+    # position += v*dt + 0.5*a*dt^2
+    A[0, 3] = dt;  A[0, 6] = dt2
+    A[1, 4] = dt;  A[1, 7] = dt2
+    A[2, 5] = dt;  A[2, 8] = dt2
+    # velocity += a*dt
+    A[3, 6] = dt
+    A[4, 7] = dt
+    A[5, 8] = dt
+    return A
+
+
+@dataclass
 class DetectionObservation:
     stamp_ns: int
     center_u: float
@@ -99,15 +139,9 @@ class TestYolov8MultiViewTriangulationNode(Node):
     def __init__(self) -> None:
         super().__init__('test_yolov8_multiview_triangulation_node')
 
-        self.declare_parameter('uav1_image_topic', '/uav1/rgb/image_raw')
-        self.declare_parameter('uav2_image_topic', '/uav2/rgb/image_raw')
-        self.declare_parameter('uav1_detection_topic', '/uav1/detection')
-        self.declare_parameter('uav2_detection_topic', '/uav2/detection')
-        self.declare_parameter('uav1_camera_info_topic', '/uav1/rgb/camera_info')
-        self.declare_parameter('uav2_camera_info_topic', '/uav2/rgb/camera_info')
-        self.declare_parameter('uav1_odom_topic', '/uav1/hw_api/ground_truth')
-        self.declare_parameter('uav2_odom_topic', '/uav2/hw_api/ground_truth')
-        self.declare_parameter('target_gt_odom_topic', '/uav3/hw_api/ground_truth')
+        self.declare_parameter('observer1_name', 'uav1')
+        self.declare_parameter('observer2_name', 'uav2')
+        self.declare_parameter('target_name', 'uav3')
         self.declare_parameter('pose_topic', '/target/pose_estimate')
         self.declare_parameter('odometry_topic', '/target/odometry_estimate')
         self.declare_parameter('estimated_position_topic', '/target/position_estimate')
@@ -125,24 +159,39 @@ class TestYolov8MultiViewTriangulationNode(Node):
         self.declare_parameter('line_width', 2)
         self.declare_parameter('target_class_id', -1)
         self.declare_parameter('max_pair_age_sec', 0.75)
-        self.declare_parameter('max_pose_age_sec', 0.75)
         self.declare_parameter('triangulation_min_baseline_m', 0.25)
         self.declare_parameter('max_triangulation_error_m', 2.0)
         self.declare_parameter('max_target_gt_age_sec', 0.75)
         self.declare_parameter('processing_rate_hz', 5.0)
-        self.declare_parameter('camera_offset_xyz_m', [0.118, 0.0, 0.016])
-        self.declare_parameter('camera_rpy_deg', [0.0, 0.0, 0.0])
-        self.declare_parameter('use_body_to_optical_conversion', True)
+        self.declare_parameter('tf_timeout_sec', 0.1)
+        self.declare_parameter('world_frame_suffix', 'world_origin')
+        self.declare_parameter('kf_process_noise_pos', 0.5)   # Q_pos
+        self.declare_parameter('kf_process_noise_vel', 1.0)   # Q_vel
+        self.declare_parameter('kf_process_noise_acc', 2.0)   # Q_acc (higher = faster adaptation to manoeuvres)
+        self.declare_parameter('kf_measurement_noise', 0.05)  # R
+        self.declare_parameter('kf_initial_covariance', 10.0)
+        self.declare_parameter('kf_prediction_horizon_sec', 2.0)  # seconds ahead to predict
+        self.declare_parameter('kf_prediction_steps', 25)          # path samples over the horizon
 
-        self.uav1_image_topic = str(self.get_parameter('uav1_image_topic').value)
-        self.uav2_image_topic = str(self.get_parameter('uav2_image_topic').value)
-        self.uav1_detection_topic = str(self.get_parameter('uav1_detection_topic').value)
-        self.uav2_detection_topic = str(self.get_parameter('uav2_detection_topic').value)
-        self.uav1_camera_info_topic = str(self.get_parameter('uav1_camera_info_topic').value)
-        self.uav2_camera_info_topic = str(self.get_parameter('uav2_camera_info_topic').value)
-        self.uav1_odom_topic = str(self.get_parameter('uav1_odom_topic').value)
-        self.uav2_odom_topic = str(self.get_parameter('uav2_odom_topic').value)
-        self.target_gt_odom_topic = str(self.get_parameter('target_gt_odom_topic').value)
+        self.observer1_name = str(self.get_parameter('observer1_name').value)
+        self.observer2_name = str(self.get_parameter('observer2_name').value)
+        self.target_name = str(self.get_parameter('target_name').value)
+
+        self.observer_roles = ['observer1', 'observer2']
+        self.observer_uav_names = {
+            'observer1': self.observer1_name,
+            'observer2': self.observer2_name,
+        }
+
+        self.image_topics: Dict[str, str] = {}
+        self.detection_topics: Dict[str, str] = {}
+        self.camera_info_topics: Dict[str, str] = {}
+        for role, uav in self.observer_uav_names.items():
+            self.image_topics[role] = f'/{uav}/rgb/image_raw'
+            self.detection_topics[role] = f'/{uav}/detection'
+            self.camera_info_topics[role] = f'/{uav}/rgb/camera_info'
+        self.target_gt_odom_topic = f'/{self.target_name}/hw_api/ground_truth'
+
         self.pose_topic = str(self.get_parameter('pose_topic').value)
         self.odometry_topic = str(self.get_parameter('odometry_topic').value)
         self.estimated_position_topic = str(self.get_parameter('estimated_position_topic').value)
@@ -157,23 +206,25 @@ class TestYolov8MultiViewTriangulationNode(Node):
         self.line_width = max(1, int(self.get_parameter('line_width').value))
         self.target_class_id = int(self.get_parameter('target_class_id').value)
         self.max_pair_age_ns = int(float(self.get_parameter('max_pair_age_sec').value) * 1_000_000_000.0)
-        self.max_pose_age_ns = int(float(self.get_parameter('max_pose_age_sec').value) * 1_000_000_000.0)
         self.triangulation_min_baseline_m = float(self.get_parameter('triangulation_min_baseline_m').value)
         self.max_triangulation_error_m = float(self.get_parameter('max_triangulation_error_m').value)
         self.max_target_gt_age_ns = int(float(self.get_parameter('max_target_gt_age_sec').value) * 1_000_000_000.0)
         self.processing_rate_hz = max(0.5, float(self.get_parameter('processing_rate_hz').value))
-        self.use_body_to_optical = bool(self.get_parameter('use_body_to_optical_conversion').value)
+        self.tf_timeout_sec = float(self.get_parameter('tf_timeout_sec').value)
+        self.world_frame_suffix = str(self.get_parameter('world_frame_suffix').value)
+        self.kf_process_noise_pos = float(self.get_parameter('kf_process_noise_pos').value)
+        self.kf_process_noise_vel = float(self.get_parameter('kf_process_noise_vel').value)
+        self.kf_process_noise_acc = float(self.get_parameter('kf_process_noise_acc').value)
+        self.kf_measurement_noise = float(self.get_parameter('kf_measurement_noise').value)
+        self.kf_initial_covariance = float(self.get_parameter('kf_initial_covariance').value)
+        self.kf_prediction_horizon_sec = float(self.get_parameter('kf_prediction_horizon_sec').value)
+        self.kf_prediction_steps = max(5, int(self.get_parameter('kf_prediction_steps').value))
 
-        camera_offset_xyz = self.get_parameter('camera_offset_xyz_m').value
-        if len(camera_offset_xyz) != 3:
-            raise ValueError('camera_offset_xyz_m must contain 3 values [x, y, z]')
-        self.t_bc = np.array(camera_offset_xyz, dtype=np.float64)
-
-        camera_rpy_deg = self.get_parameter('camera_rpy_deg').value
-        if len(camera_rpy_deg) != 3:
-            raise ValueError('camera_rpy_deg must contain 3 values [roll, pitch, yaw]')
-        roll, pitch, yaw = [np.deg2rad(float(v)) for v in camera_rpy_deg]
-        self.r_bc = rpy_to_rotmat(roll, pitch, yaw)
+        # If target_frame_id was left as the generic default 'world', auto-derive it from observer1 +
+        # world_frame_suffix so that published poses are in the same TF frame used by triangulation.
+        if self.target_frame_id == 'world':
+            self.target_frame_id = f'{self.observer1_name}/{self.world_frame_suffix}'
+        self.get_logger().info(f'Publishing all estimate topics in frame: {self.target_frame_id}')
 
         if not os.path.exists(self.model_path):
             raise FileNotFoundError(f'Model not found: {self.model_path}')
@@ -182,65 +233,85 @@ class TestYolov8MultiViewTriangulationNode(Node):
         self.model = YOLO(self.model_path)
         self.model.fuse()
 
-        self.camera_infos: Dict[str, Optional[CameraInfo]] = {'uav1': None, 'uav2': None}
-        self.odometries: Dict[str, Optional[Odometry]] = {'uav1': None, 'uav2': None}
-        self.observations: Dict[str, Optional[DetectionObservation]] = {'uav1': None, 'uav2': None}
-        self.latest_images: Dict[str, Optional[Image]] = {'uav1': None, 'uav2': None}
-        self.last_processed_image_stamp_ns: Dict[str, int] = {'uav1': -1, 'uav2': -1}
+        self.camera_infos: Dict[str, Optional[CameraInfo]] = {r: None for r in self.observer_roles}
+        self.observations: Dict[str, Optional[DetectionObservation]] = {r: None for r in self.observer_roles}
+        self.latest_images: Dict[str, Optional[Image]] = {r: None for r in self.observer_roles}
+        self.last_processed_image_stamp_ns: Dict[str, int] = {r: -1 for r in self.observer_roles}
         self.target_gt_odom: Optional[Odometry] = None
 
-        self.last_pose_ns: Optional[int] = None
-        self.last_pose_position: Optional[np.ndarray] = None
+        # --- Linear Kalman Filter (constant-acceleration model, CA) ---
+        # State: [px, py, pz, vx, vy, vz, ax, ay, az],  Measurement: [px, py, pz]
+        A0 = np.eye(9, dtype=np.float64)        # updated with dt before each predict
+        B0 = np.zeros((9, 1), dtype=np.float64)  # no control input
+        H0 = np.zeros((3, 9), dtype=np.float64)
+        H0[0, 0] = H0[1, 1] = H0[2, 2] = 1.0
+        self.kf = LinearKalmanFilter(A0, B0, H0)
+        self.kf_Q = np.diag([
+            self.kf_process_noise_pos, self.kf_process_noise_pos, self.kf_process_noise_pos,
+            self.kf_process_noise_vel, self.kf_process_noise_vel, self.kf_process_noise_vel,
+            self.kf_process_noise_acc, self.kf_process_noise_acc, self.kf_process_noise_acc,
+        ])
+        self.kf_R = np.eye(3, dtype=np.float64) * self.kf_measurement_noise
+        self.kf_u = np.zeros(1, dtype=np.float64)
+        self.kf_sc: Optional[StateCov] = None
+        self.kf_last_stamp_ns: Optional[int] = None
+
         self.last_error_log_time = time.time()
         self.frame_counter = 0
         self.last_log_time = time.time()
 
-        self.uav1_detection_pub = self.create_publisher(Image, self.uav1_detection_topic, 10)
-        self.uav2_detection_pub = self.create_publisher(Image, self.uav2_detection_topic, 10)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        self.detection_pubs = {}
+        for role in self.observer_roles:
+            self.detection_pubs[role] = self.create_publisher(Image, self.detection_topics[role], 10)
         self.pose_pub = self.create_publisher(PoseStamped, self.pose_topic, 10)
         self.odometry_pub = self.create_publisher(Odometry, self.odometry_topic, 10)
         self.estimated_position_pub = self.create_publisher(Vector3Stamped, self.estimated_position_topic, 10)
         self.error_vector_pub = self.create_publisher(Vector3Stamped, self.error_vector_topic, 10)
+        self.predicted_trajectory_pub = self.create_publisher(Path, '/target/predicted_trajectory', 10)
+        self.trajectory_markers_pub = self.create_publisher(MarkerArray, '/target/predicted_trajectory_markers', 10)
+        self.position_markers_pub = self.create_publisher(MarkerArray, '/target/position_markers', 10)
 
-        self.create_subscription(Image, self.uav1_image_topic, self.uav1_image_callback, 1)
-        self.create_subscription(Image, self.uav2_image_topic, self.uav2_image_callback, 1)
-        self.create_subscription(CameraInfo, self.uav1_camera_info_topic, lambda msg: self.camera_info_callback('uav1', msg), 10)
-        self.create_subscription(CameraInfo, self.uav2_camera_info_topic, lambda msg: self.camera_info_callback('uav2', msg), 10)
-        self.create_subscription(Odometry, self.uav1_odom_topic, lambda msg: self.odom_callback('uav1', msg), 20)
-        self.create_subscription(Odometry, self.uav2_odom_topic, lambda msg: self.odom_callback('uav2', msg), 20)
+        for role in self.observer_roles:
+            self.create_subscription(
+                Image, self.image_topics[role],
+                lambda msg, r=role: self.image_callback(r, msg), 1,
+            )
+            self.create_subscription(
+                CameraInfo, self.camera_info_topics[role],
+                lambda msg, r=role: self.camera_info_callback(r, msg), 10,
+            )
         self.create_subscription(Odometry, self.target_gt_odom_topic, self.target_gt_odom_callback, 20)
         self.create_timer(1.0 / self.processing_rate_hz, self.processing_timer_callback)
 
         self.get_logger().info(f'YOLO model path: {self.model_path}')
-        self.get_logger().info(f'uav1 image: {self.uav1_image_topic} -> {self.uav1_detection_topic}')
-        self.get_logger().info(f'uav2 image: {self.uav2_image_topic} -> {self.uav2_detection_topic}')
-        self.get_logger().info(f'uav1 odom: {self.uav1_odom_topic}')
-        self.get_logger().info(f'uav2 odom: {self.uav2_odom_topic}')
-        self.get_logger().info(f'target GT odom: {self.target_gt_odom_topic}')
+        for role in self.observer_roles:
+            uav = self.observer_uav_names[role]
+            self.get_logger().info(
+                f'{role} ({uav}): {self.image_topics[role]} -> {self.detection_topics[role]}'
+            )
+        self.get_logger().info(f'Target UAV: {self.target_name} (GT: {self.target_gt_odom_topic})')
+        self.get_logger().info(f'TF world frame suffix: {self.world_frame_suffix}')
         self.get_logger().info(f'Pose topic: {self.pose_topic}')
         self.get_logger().info(f'Odometry topic: {self.odometry_topic}')
         self.get_logger().info(f'Estimated position topic: {self.estimated_position_topic}')
         self.get_logger().info(f'Error vector topic: {self.error_vector_topic}')
         self.get_logger().info(f'Processing rate: {self.processing_rate_hz:.1f} Hz')
 
-    def camera_info_callback(self, uav_name: str, msg: CameraInfo) -> None:
-        self.camera_infos[uav_name] = msg
-
-    def odom_callback(self, uav_name: str, msg: Odometry) -> None:
-        self.odometries[uav_name] = msg
+    def camera_info_callback(self, role: str, msg: CameraInfo) -> None:
+        self.camera_infos[role] = msg
 
     def target_gt_odom_callback(self, msg: Odometry) -> None:
         self.target_gt_odom = msg
 
-    def uav1_image_callback(self, msg: Image) -> None:
-        self.latest_images['uav1'] = msg
-
-    def uav2_image_callback(self, msg: Image) -> None:
-        self.latest_images['uav2'] = msg
+    def image_callback(self, role: str, msg: Image) -> None:
+        self.latest_images[role] = msg
 
     def processing_timer_callback(self) -> None:
-        self.process_latest_image('uav1', self.uav1_detection_pub)
-        self.process_latest_image('uav2', self.uav2_detection_pub)
+        for role in self.observer_roles:
+            self.process_latest_image(role, self.detection_pubs[role])
 
     def process_latest_image(self, uav_name: str, publisher) -> None:
         msg = self.latest_images[uav_name]
@@ -374,26 +445,25 @@ class TestYolov8MultiViewTriangulationNode(Node):
         return annotated
 
     def try_triangulate(self) -> None:
-        obs1 = self.observations['uav1']
-        obs2 = self.observations['uav2']
-        info1 = self.camera_infos['uav1']
-        info2 = self.camera_infos['uav2']
-        odom1 = self.odometries['uav1']
-        odom2 = self.odometries['uav2']
+        obs1 = self.observations['observer1']
+        obs2 = self.observations['observer2']
+        info1 = self.camera_infos['observer1']
+        info2 = self.camera_infos['observer2']
 
-        if obs1 is None or obs2 is None or info1 is None or info2 is None or odom1 is None or odom2 is None:
+        if obs1 is None or obs2 is None or info1 is None or info2 is None:
             return
 
         if abs(obs1.stamp_ns - obs2.stamp_ns) > self.max_pair_age_ns:
             return
 
-        odom1_age = abs(obs1.stamp_ns - stamp_to_ns(odom1.header.stamp))
-        odom2_age = abs(obs2.stamp_ns - stamp_to_ns(odom2.header.stamp))
-        if odom1_age > self.max_pose_age_ns or odom2_age > self.max_pose_age_ns:
+        result1 = self.pixel_to_world_ray(info1, obs1.stamp_ns, obs1.center_u, obs1.center_v)
+        result2 = self.pixel_to_world_ray(info2, obs2.stamp_ns, obs2.center_u, obs2.center_v)
+
+        if result1 is None or result2 is None:
             return
 
-        origin1, dir1 = self.pixel_to_world_ray(info1, odom1, obs1.center_u, obs1.center_v)
-        origin2, dir2 = self.pixel_to_world_ray(info2, odom2, obs2.center_u, obs2.center_v)
+        origin1, dir1 = result1
+        origin2, dir2 = result2
 
         baseline = float(np.linalg.norm(origin2 - origin1))
         if baseline < self.triangulation_min_baseline_m:
@@ -407,37 +477,71 @@ class TestYolov8MultiViewTriangulationNode(Node):
             return
 
         stamp_ns = max(obs1.stamp_ns, obs2.stamp_ns)
-        self.publish_pose_estimate(midpoint, stamp_ns)
-        self.publish_ground_truth_error(midpoint, stamp_ns)
+        measurement = midpoint
+
+        # --- KF predict + correct ---
+        if self.kf_sc is None:
+            x0 = np.zeros(9, dtype=np.float64)
+            x0[:3] = measurement
+            P0 = np.eye(9, dtype=np.float64) * self.kf_initial_covariance
+            self.kf_sc = StateCov(x=x0, P=P0)
+            self.kf_last_stamp_ns = stamp_ns
+        else:
+            dt = (stamp_ns - self.kf_last_stamp_ns) / 1_000_000_000.0
+            if dt > 0.0:
+                self.kf.A = build_transition_matrix(dt)
+                self.kf_sc = self.kf.predict(self.kf_sc, self.kf_u, self.kf_Q, dt)
+                self.kf_last_stamp_ns = stamp_ns
+        self.kf_sc = self.kf.correct(self.kf_sc, measurement, self.kf_R)
+
+        filtered_position     = self.kf_sc.x[:3].copy()
+        filtered_velocity     = self.kf_sc.x[3:6].copy()
+        filtered_acceleration = self.kf_sc.x[6:9].copy()
+
+        self.publish_pose_estimate(filtered_position, filtered_velocity, filtered_acceleration, stamp_ns)
+        self.publish_ground_truth_error(filtered_position, stamp_ns)
 
     def pixel_to_world_ray(
         self,
         camera_info: CameraInfo,
-        odom: Odometry,
+        stamp_ns: int,
         u: float,
         v: float,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         fx = float(camera_info.k[0])
         fy = float(camera_info.k[4])
         cx = float(camera_info.k[2])
         cy = float(camera_info.k[5])
 
         ray_optical = normalize(np.array([(u - cx) / fx, (v - cy) / fy, 1.0], dtype=np.float64))
-        if self.use_body_to_optical:
-            ray_camera = optical_to_camera_ray(ray_optical)
-        else:
-            ray_camera = ray_optical
 
-        pose = odom.pose.pose
-        position_world = np.array([pose.position.x, pose.position.y, pose.position.z], dtype=np.float64)
-        r_wb = quat_to_rotmat(pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w)
+        camera_frame = camera_info.header.frame_id
+        prefix = camera_frame.split('/')[0] if '/' in camera_frame else camera_frame
+        world_frame = f'{prefix}/{self.world_frame_suffix}'
 
-        camera_origin_world = position_world + r_wb @ self.t_bc
-        ray_body = self.r_bc @ ray_camera
-        ray_world = normalize(r_wb @ ray_body)
+        try:
+            sec = stamp_ns // 1_000_000_000
+            nanosec = stamp_ns % 1_000_000_000
+            lookup_time = Time(seconds=sec, nanoseconds=nanosec)
+            timeout = Duration(seconds=self.tf_timeout_sec)
+            transform = self.tf_buffer.lookup_transform(
+                world_frame, camera_frame, lookup_time, timeout
+            )
+        except Exception as exc:
+            self.get_logger().warn(
+                f'TF lookup {world_frame} <- {camera_frame} failed: {exc}',
+                throttle_duration_sec=2.0,
+            )
+            return None
+
+        t = transform.transform.translation
+        q = transform.transform.rotation
+        camera_origin_world = np.array([t.x, t.y, t.z], dtype=np.float64)
+        r_wc = quat_to_rotmat(q.x, q.y, q.z, q.w)
+        ray_world = normalize(r_wc @ ray_optical)
         return camera_origin_world, ray_world
 
-    def publish_pose_estimate(self, position: np.ndarray, stamp_ns: int) -> None:
+    def publish_pose_estimate(self, position: np.ndarray, velocity: np.ndarray, acceleration: np.ndarray, stamp_ns: int) -> None:
         sec = stamp_ns // 1_000_000_000
         nanosec = stamp_ns % 1_000_000_000
 
@@ -460,25 +564,157 @@ class TestYolov8MultiViewTriangulationNode(Node):
         pose_msg.pose.orientation.w = 1.0
         self.pose_pub.publish(pose_msg)
 
+        # Covariance from KF state (if available)
+        P = self.kf_sc.P if self.kf_sc is not None else np.eye(9)
+
         odom_msg = Odometry()
         odom_msg.header = pose_msg.header
         odom_msg.child_frame_id = 'target_estimate'
         odom_msg.pose.pose = pose_msg.pose
-        odom_msg.pose.covariance[0] = 0.25
-        odom_msg.pose.covariance[7] = 0.25
-        odom_msg.pose.covariance[14] = 0.25
+        odom_msg.pose.covariance[0] = float(P[0, 0])
+        odom_msg.pose.covariance[7] = float(P[1, 1])
+        odom_msg.pose.covariance[14] = float(P[2, 2])
 
-        if self.last_pose_ns is not None and self.last_pose_position is not None and stamp_ns > self.last_pose_ns:
-            dt = (stamp_ns - self.last_pose_ns) / 1_000_000_000.0
-            if 1e-3 < dt < 1.0:
-                velocity = (position - self.last_pose_position) / dt
-                odom_msg.twist.twist.linear.x = float(velocity[0])
-                odom_msg.twist.twist.linear.y = float(velocity[1])
-                odom_msg.twist.twist.linear.z = float(velocity[2])
+        odom_msg.twist.twist.linear.x = float(velocity[0])
+        odom_msg.twist.twist.linear.y = float(velocity[1])
+        odom_msg.twist.twist.linear.z = float(velocity[2])
+        odom_msg.twist.covariance[0] = float(P[3, 3])
+        odom_msg.twist.covariance[7] = float(P[4, 4])
+        odom_msg.twist.covariance[14] = float(P[5, 5])
 
         self.odometry_pub.publish(odom_msg)
-        self.last_pose_ns = stamp_ns
-        self.last_pose_position = position.copy()
+        self._publish_predicted_trajectory(position, velocity, acceleration, stamp_ns)
+        self._publish_position_markers(position, stamp_ns)
+
+    def _publish_predicted_trajectory(
+        self,
+        position: np.ndarray,
+        velocity: np.ndarray,
+        acceleration: np.ndarray,
+        stamp_ns: int,
+    ) -> None:
+        """Publish predicted CA trajectory as a Path and as RViz arrow markers."""
+        sec = int(stamp_ns // 1_000_000_000)
+        nanosec = int(stamp_ns % 1_000_000_000)
+
+        path_msg = Path()
+        path_msg.header.frame_id = self.target_frame_id
+        path_msg.header.stamp.sec = sec
+        path_msg.header.stamp.nanosec = nanosec
+
+        dt_step = self.kf_prediction_horizon_sec / self.kf_prediction_steps
+        pred_points: List[np.ndarray] = []
+        for i in range(self.kf_prediction_steps + 1):
+            t = i * dt_step
+            pred_pos = position + velocity * t + 0.5 * acceleration * (t * t)
+            pred_points.append(pred_pos)
+
+            pred_stamp_ns = stamp_ns + int(t * 1_000_000_000)
+            pose = PoseStamped()
+            pose.header.frame_id = self.target_frame_id
+            pose.header.stamp.sec = int(pred_stamp_ns // 1_000_000_000)
+            pose.header.stamp.nanosec = int(pred_stamp_ns % 1_000_000_000)
+            pose.pose.position.x = float(pred_pos[0])
+            pose.pose.position.y = float(pred_pos[1])
+            pose.pose.position.z = float(pred_pos[2])
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+
+        self.predicted_trajectory_pub.publish(path_msg)
+
+        # --- Arrow markers (yellow → red gradient along the horizon) ---
+        marker_array = MarkerArray()
+
+        # DELETEALL clears leftover arrows from previous frames
+        clear = Marker()
+        clear.header.frame_id = self.target_frame_id
+        clear.header.stamp.sec = sec
+        clear.header.stamp.nanosec = nanosec
+        clear.ns = 'predicted_traj'
+        clear.action = Marker.DELETEALL
+        marker_array.markers.append(clear)
+
+        n_segments = len(pred_points) - 1
+        for i in range(n_segments):
+            alpha = i / max(1, n_segments - 1)  # 0 (near/yellow) → 1 (far/red)
+            m = Marker()
+            m.header.frame_id = self.target_frame_id
+            m.header.stamp.sec = sec
+            m.header.stamp.nanosec = nanosec
+            m.ns = 'predicted_traj'
+            m.id = i + 1
+            m.type = Marker.ARROW
+            m.action = Marker.ADD
+            m.scale.x = 0.06   # shaft diameter [m]
+            m.scale.y = 0.14   # head diameter  [m]
+            m.scale.z = 0.0    # head length 0 → auto
+            m.color.r = 1.0
+            m.color.g = float(1.0 - alpha)
+            m.color.b = 0.0
+            m.color.a = float(0.9 - 0.45 * alpha)
+            m.lifetime.sec = 1  # auto-expire so stale arrows vanish
+            p0 = pred_points[i]
+            p1 = pred_points[i + 1]
+            m.points = [
+                Point(x=float(p0[0]), y=float(p0[1]), z=float(p0[2])),
+                Point(x=float(p1[0]), y=float(p1[1]), z=float(p1[2])),
+            ]
+            marker_array.markers.append(m)
+
+        self.trajectory_markers_pub.publish(marker_array)
+
+    def _publish_position_markers(self, position: np.ndarray, stamp_ns: int) -> None:
+        """Publish a blue sphere (estimated) and a green sphere (GT) in RViz."""
+        sec = int(stamp_ns // 1_000_000_000)
+        nanosec = int(stamp_ns % 1_000_000_000)
+        marker_array = MarkerArray()
+
+        # Blue sphere – estimated position
+        est = Marker()
+        est.header.frame_id = self.target_frame_id
+        est.header.stamp.sec = sec
+        est.header.stamp.nanosec = nanosec
+        est.ns = 'position_estimate'
+        est.id = 0
+        est.type = Marker.SPHERE
+        est.action = Marker.ADD
+        est.pose.position.x = float(position[0])
+        est.pose.position.y = float(position[1])
+        est.pose.position.z = float(position[2])
+        est.pose.orientation.w = 1.0
+        est.scale.x = est.scale.y = est.scale.z = 0.4
+        est.color.r = 0.0
+        est.color.g = 0.4
+        est.color.b = 1.0
+        est.color.a = 0.9
+        est.lifetime.sec = 1
+        marker_array.markers.append(est)
+
+        # Green sphere – ground-truth position (only when fresh)
+        if self.target_gt_odom is not None:
+            gt_stamp_ns = stamp_to_ns(self.target_gt_odom.header.stamp)
+            if abs(stamp_ns - gt_stamp_ns) <= self.max_target_gt_age_ns:
+                gt = Marker()
+                gt.header.frame_id = self.target_frame_id
+                gt.header.stamp.sec = sec
+                gt.header.stamp.nanosec = nanosec
+                gt.ns = 'position_ground_truth'
+                gt.id = 1
+                gt.type = Marker.SPHERE
+                gt.action = Marker.ADD
+                gt.pose.position.x = float(self.target_gt_odom.pose.pose.position.x)
+                gt.pose.position.y = float(self.target_gt_odom.pose.pose.position.y)
+                gt.pose.position.z = float(self.target_gt_odom.pose.pose.position.z)
+                gt.pose.orientation.w = 1.0
+                gt.scale.x = gt.scale.y = gt.scale.z = 0.4
+                gt.color.r = 0.0
+                gt.color.g = 1.0
+                gt.color.b = 0.0
+                gt.color.a = 0.9
+                gt.lifetime.sec = 1
+                marker_array.markers.append(gt)
+
+        self.position_markers_pub.publish(marker_array)
 
     def publish_ground_truth_error(self, estimated_position: np.ndarray, stamp_ns: int) -> None:
         if self.target_gt_odom is None:
