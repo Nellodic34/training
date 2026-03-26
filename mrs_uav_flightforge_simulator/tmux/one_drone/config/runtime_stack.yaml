@@ -1,6 +1,6 @@
 launcher:
   auto_start_node: triangulation  # one of: none, detection, triangulation
-  open_error_plot: true
+  open_error_plot: false
   plot_delay_sec: 10
 
 simulation:
@@ -13,7 +13,12 @@ uav_roles:
 
 ekf:
   # EKF tuning values passed to the multi-view triangulation node.
-  kf_process_noise_pos: 0.5   # Process noise applied to the position states in the prediction model.
-  kf_process_noise_vel: 1.0   # Process noise applied to the velocity states in the prediction model.
-  kf_measurement_noise: 0.05  # Measurement noise covariance; lower values trust triangulated points more.
-  kf_initial_covariance: 10.0 # Initial covariance assigned when the filter state is created.
+  kf_process_noise_acc: 1.2    # White-jerk std (CA model). Lower = drone makes smooth curves
+  kf_process_noise_vel: 2.0    # White-accel std (CV model process noise). Higher = drone can accelerate a lot
+  imm_transition_prob: 0.90    # Probability of staying in the same dynamic model
+  kf_measurement_noise: 0.05   # Base measurement noise R (used when rays are orthogonal)
+  kf_adaptive_cov_max_multiplier: 50.0 # Max multiplier for depth variance when rays are nearly parallel
+  kf_initial_covariance: 1.0   # Initial covariance assigned when the filter state is created.
+
+
+

@@ -20,11 +20,11 @@ class TestYolov8RealtimeNode(Node):
         self.declare_parameter('output_image_topic', '/test_img')
         self.declare_parameter(
             'model_path',
-            '~/datasets/uav_detector/20260227_174226/runs/detect/exp1/run1_debug2/weights/best.pt',
+            '~/runs/detect/drone_detector_n_9602/weights/best.pt',
         )
         self.declare_parameter('confidence_threshold', 0.25)
         self.declare_parameter('iou_threshold', 0.45)
-        self.declare_parameter('imgsz', 640)
+        self.declare_parameter('imgsz', 960)
         self.declare_parameter('max_detections', 100)
         self.declare_parameter('device', 'cpu')
         self.declare_parameter('line_width', 2)

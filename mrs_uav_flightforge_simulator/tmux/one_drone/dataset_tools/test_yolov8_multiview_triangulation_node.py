@@ -92,9 +92,9 @@ class LinearKalmanFilter:
         self.n = A.shape[0]
 
     def predict(self, sc: StateCov, u: np.ndarray, Q: np.ndarray, dt: float) -> StateCov:
-        """Prediction step.  Q is scaled by dt (same as mrs_lib::LKF::predict)."""
+        """Prediction step with discrete-time process covariance Q."""
         x_pred = self.A @ sc.x + self.B @ u
-        P_pred = self.A @ sc.P @ self.A.T + Q * dt
+        P_pred = self.A @ sc.P @ self.A.T + Q
         return StateCov(x=x_pred, P=P_pred)
 
     def correct(self, sc: StateCov, z: np.ndarray, R: np.ndarray) -> StateCov:
@@ -107,7 +107,7 @@ class LinearKalmanFilter:
         return StateCov(x=x_new, P=P_new)
 
 
-def build_transition_matrix(dt: float) -> np.ndarray:
+def build_transition_matrix_ca(dt: float) -> np.ndarray:
     """Build 9x9 constant-acceleration (CA) transition matrix A(dt).
 
     State layout: [px, py, pz, vx, vy, vz, ax, ay, az]
@@ -123,6 +123,252 @@ def build_transition_matrix(dt: float) -> np.ndarray:
     A[4, 7] = dt
     A[5, 8] = dt
     return A
+
+
+def build_process_noise_ca(dt: float, sigma_a: float) -> np.ndarray:
+    """Build discrete Q for 3D CA model with white-jerk driving noise.
+
+    The per-axis block for [p, v, a] is:
+      q * [[dt^5/20, dt^4/8, dt^3/6],
+           [dt^4/8,  dt^3/3, dt^2/2],
+           [dt^3/6,  dt^2/2, dt]]
+    where q = sigma_a^2.
+    """
+    dt = float(max(0.0, dt))
+    q = float(max(1e-9, sigma_a) ** 2)
+
+    dt2 = dt * dt
+    dt3 = dt2 * dt
+    dt4 = dt3 * dt
+    dt5 = dt4 * dt
+
+    q_block = np.array(
+        [
+            [dt5 / 20.0, dt4 / 8.0, dt3 / 6.0],
+            [dt4 / 8.0, dt3 / 3.0, dt2 / 2.0],
+            [dt3 / 6.0, dt2 / 2.0, dt],
+        ],
+        dtype=np.float64,
+    )
+    q_block *= q
+
+    Q = np.zeros((9, 9), dtype=np.float64)
+    for axis in range(3):
+        idx = [axis, axis + 3, axis + 6]
+        Q[np.ix_(idx, idx)] = q_block
+    return Q
+
+
+def build_transition_matrix_cv(dt: float) -> np.ndarray:
+    """Build 6x6 constant-velocity (CV) transition matrix A(dt).
+    
+    State layout: [px, py, pz, vx, vy, vz]
+    """
+    A = np.eye(6, dtype=np.float64)
+    A[0, 3] = dt
+    A[1, 4] = dt
+    A[2, 5] = dt
+    return A
+
+
+def build_process_noise_cv(dt: float, sigma_v: float) -> np.ndarray:
+    """Build discrete Q for 3D CV model with white-acceleration driving noise."""
+    dt = float(max(0.0, dt))
+    q = float(max(1e-9, sigma_v) ** 2)
+
+    dt2 = dt * dt
+    dt3 = dt2 * dt
+
+    q_block = np.array(
+        [
+            [dt3 / 3.0, dt2 / 2.0],
+            [dt2 / 2.0, dt],
+        ],
+        dtype=np.float64,
+    )
+    q_block *= q
+
+    Q = np.zeros((6, 6), dtype=np.float64)
+    for axis in range(3):
+        idx = [axis, axis + 3]
+        Q[np.ix_(idx, idx)] = q_block
+    return Q
+
+
+class IMMFilter:
+    def __init__(self, pi: np.ndarray, model_probs: np.ndarray):
+        """
+        Interacting Multiple Model filter.
+        :param pi: Markov transition probability matrix (N_models x N_models)
+        :param model_probs: initial probabilities of each model (N_models,)
+        """
+        self.pi = pi.copy()
+        self.mu = model_probs.copy()
+        
+        # Two models: 0 = CV (6D), 1 = CA (9D)
+        
+        # Model 0: Constant Velocity
+        A0 = np.eye(6, dtype=np.float64)
+        B0 = np.zeros((6, 1), dtype=np.float64)
+        H0 = np.zeros((3, 6), dtype=np.float64)
+        H0[0, 0] = H0[1, 1] = H0[2, 2] = 1.0
+        self.kf_cv = LinearKalmanFilter(A0, B0, H0)
+        self.sc_cv: Optional[StateCov] = None
+        
+        # Model 1: Constant Acceleration
+        A1 = np.eye(9, dtype=np.float64)
+        B1 = np.zeros((9, 1), dtype=np.float64)
+        H1 = np.zeros((3, 9), dtype=np.float64)
+        H1[0, 0] = H1[1, 1] = H1[2, 2] = 1.0
+        self.kf_ca = LinearKalmanFilter(A1, B1, H1)
+        self.sc_ca: Optional[StateCov] = None
+        
+        self.n = 2  # number of models
+
+    def initialize(self, measurement: np.ndarray, P_init_diag: float):
+        # Init CV (6D)
+        x0_cv = np.zeros(6, dtype=np.float64)
+        x0_cv[:3] = measurement
+        P0_cv = np.eye(6, dtype=np.float64) * P_init_diag
+        self.sc_cv = StateCov(x=x0_cv, P=P0_cv)
+        
+        # Init CA (9D)
+        x0_ca = np.zeros(9, dtype=np.float64)
+        x0_ca[:3] = measurement
+        P0_ca = np.eye(9, dtype=np.float64) * P_init_diag
+        self.sc_ca = StateCov(x=x0_ca, P=P0_ca)
+
+    def _state_ca_to_cv(self, x_ca: np.ndarray) -> np.ndarray:
+        return x_ca[:6]
+    
+    def _cov_ca_to_cv(self, P_ca: np.ndarray) -> np.ndarray:
+        return P_ca[:6, :6]
+        
+    def _state_cv_to_ca(self, x_cv: np.ndarray) -> np.ndarray:
+        x_ca = np.zeros(9, dtype=np.float64)
+        x_ca[:6] = x_cv
+        return x_ca
+        
+    def _cov_cv_to_ca(self, P_cv: np.ndarray) -> np.ndarray:
+        P_ca = np.zeros((9, 9), dtype=np.float64)
+        P_ca[:6, :6] = P_cv
+        # Initialize acceleration variance appropriately, e.g. same as initial
+        P_ca[6, 6] = P_ca[7, 7] = P_ca[8, 8] = 1.0 
+        return P_ca
+
+    def predict_and_correct(self, dt: float, Q_cv: np.ndarray, Q_ca: np.ndarray, z: np.ndarray, R: np.ndarray, mahalanobis_thresh: float = 9.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+        """Runs the IMM mixing, prediction, and correction steps. Returns Combined State, Combined Cov, Probabilities, Accepted flag."""
+        assert self.sc_cv is not None
+        assert self.sc_ca is not None
+        
+        # 1. Mixing Probabilities
+        c_bar = self.pi.T @ self.mu  # normalization factors
+        mu_mix = np.zeros((2, 2), dtype=np.float64)
+        for i in range(2):
+            for j in range(2):
+                mu_mix[i, j] = self.pi[i, j] * self.mu[i] / max(c_bar[j], 1e-12)
+        
+        # Extract states
+        x_cv = self.sc_cv.x
+        x_ca = self.sc_ca.x
+        P_cv = self.sc_cv.P
+        P_ca = self.sc_ca.P
+        
+        # Dim alignment: project CA to 6D, CV to 9D
+        x_ca_as_cv = self._state_ca_to_cv(x_ca)
+        x_cv_as_ca = self._state_cv_to_ca(x_cv)
+        # CRITICAL FIX: Do NOT let the CV model erase the CA model's memory of acceleration 
+        # during the mixing step! We inject the existing CA acceleration into the CV-lifted state.
+        x_cv_as_ca[6:9] = x_ca[6:9]
+        
+        # Mixed initial states
+        x0_mix_cv = x_cv * mu_mix[0, 0] + x_ca_as_cv * mu_mix[1, 0]
+        x0_mix_ca = x_cv_as_ca * mu_mix[0, 1] + x_ca * mu_mix[1, 1]
+        
+        # Mixed initial covariances
+        dx0 = x_cv - x0_mix_cv
+        dx1 = x_ca_as_cv - x0_mix_cv
+        P0_mix_cv = mu_mix[0, 0] * (P_cv + np.outer(dx0, dx0)) + mu_mix[1, 0] * (self._cov_ca_to_cv(P_ca) + np.outer(dx1, dx1))
+        
+        dx0_ca = x_cv_as_ca - x0_mix_ca
+        dx1_ca = x_ca - x0_mix_ca
+        P0_mix_ca = mu_mix[0, 1] * (self._cov_cv_to_ca(P_cv) + np.outer(dx0_ca, dx0_ca)) + mu_mix[1, 1] * (P_ca + np.outer(dx1_ca, dx1_ca))
+        
+        # Set mixed states
+        self.sc_cv.x = x0_mix_cv
+        self.sc_cv.P = P0_mix_cv
+        self.sc_ca.x = x0_mix_ca
+        self.sc_ca.P = P0_mix_ca
+        
+        # 2. Mode-Matched Filtering (Predict & Correct)
+        u_cv = np.zeros(1, dtype=np.float64)
+        u_ca = np.zeros(1, dtype=np.float64)
+        
+        self.kf_cv.A = build_transition_matrix_cv(dt)
+        sc_pred_cv = self.kf_cv.predict(self.sc_cv, u_cv, Q_cv, dt)
+        
+        self.kf_ca.A = build_transition_matrix_ca(dt)
+        sc_pred_ca = self.kf_ca.predict(self.sc_ca, u_ca, Q_ca, dt)
+        
+        # Calculate likelihoods before update
+        y_cv = z - self.kf_cv.H @ sc_pred_cv.x
+        S_cv = self.kf_cv.H @ sc_pred_cv.P @ self.kf_cv.H.T + R
+        
+        y_ca = z - self.kf_ca.H @ sc_pred_ca.x
+        S_ca = self.kf_ca.H @ sc_pred_ca.P @ self.kf_ca.H.T + R
+        
+        # --- Mahalanobis Distance Gating ---
+        # Eliminate robust outliers by checking if the measurement is physically
+        # impossible given the current prediction covariance.
+        invS_cv_true = np.linalg.inv(S_cv)
+        d_cv = float(y_cv.T @ invS_cv_true @ y_cv)
+        
+        invS_ca_true = np.linalg.inv(S_ca)
+        d_ca = float(y_ca.T @ invS_ca_true @ y_ca)
+        
+        accepted = True
+        if d_cv > mahalanobis_thresh and d_ca > mahalanobis_thresh:
+            # Outlier detected! Skip the Correct step and just propagate the prediction forward.
+            self.sc_cv = sc_pred_cv
+            self.sc_ca = sc_pred_ca
+            accepted = False
+            
+            # Recombine state based on pure prediction without measurement update
+            x_comb = self._state_cv_to_ca(self.sc_cv.x) * self.mu[0] + self.sc_ca.x * self.mu[1]
+            dx0_comb = self._state_cv_to_ca(self.sc_cv.x) - x_comb
+            dx1_comb = self.sc_ca.x - x_comb
+            P_comb = self.mu[0] * (self._cov_cv_to_ca(self.sc_cv.P) + np.outer(dx0_comb, dx0_comb)) + \
+                     self.mu[1] * (self.sc_ca.P + np.outer(dx1_comb, dx1_comb))
+            return x_comb, P_comb, self.mu, accepted
+        
+        def mv_normal_pdf_fixed(y, S_fixed):
+            # Calculate likelihood purely on prediction accuracy against the measurement noise
+            # This avoids the "covariance scaling paradox" in IMMs where a noisier model wins
+            # because its PDF is flatter and wider.
+            invS = np.linalg.inv(S_fixed)
+            exponent = -0.5 * y.T @ invS @ y
+            return float(np.exp(max(-50.0, min(50.0, exponent))))
+            
+        Lambda = np.array([mv_normal_pdf_fixed(y_cv, R), mv_normal_pdf_fixed(y_ca, R)])
+        
+        # Correct step
+        self.sc_cv = self.kf_cv.correct(sc_pred_cv, z, R)
+        self.sc_ca = self.kf_ca.correct(sc_pred_ca, z, R)
+        
+        # 3. Mode Probability Update
+        self.mu = Lambda * c_bar
+        self.mu /= np.sum(self.mu) + 1e-12
+        
+        # 4. Combination
+        x_comb = self._state_cv_to_ca(self.sc_cv.x) * self.mu[0] + self.sc_ca.x * self.mu[1]
+        
+        dx0_comb = self._state_cv_to_ca(self.sc_cv.x) - x_comb
+        dx1_comb = self.sc_ca.x - x_comb
+        
+        P_comb = self.mu[0] * (self._cov_cv_to_ca(self.sc_cv.P) + np.outer(dx0_comb, dx0_comb)) + \
+                 self.mu[1] * (self.sc_ca.P + np.outer(dx1_comb, dx1_comb))
+                 
+        return x_comb, P_comb, self.mu, accepted
 
 
 @dataclass
@@ -149,28 +395,29 @@ class TestYolov8MultiViewTriangulationNode(Node):
         self.declare_parameter('target_frame_id', 'world')
         self.declare_parameter(
             'model_path',
-            '~/datasets/uav_detector/20260227_174226/runs/detect/exp1/run1_debug2/weights/best.pt',
+            '~/runs/detect/drone_detector_n_9602/weights/best.pt',
         )
         self.declare_parameter('confidence_threshold', 0.25)
         self.declare_parameter('iou_threshold', 0.45)
-        self.declare_parameter('imgsz', 640)
+        self.declare_parameter('imgsz', 960)
         self.declare_parameter('max_detections', 100)
-        self.declare_parameter('device', 'cpu')
+        self.declare_parameter('device', 'cuda')
         self.declare_parameter('line_width', 2)
         self.declare_parameter('target_class_id', -1)
         self.declare_parameter('max_pair_age_sec', 0.75)
         self.declare_parameter('triangulation_min_baseline_m', 0.25)
         self.declare_parameter('max_triangulation_error_m', 2.0)
         self.declare_parameter('max_target_gt_age_sec', 0.75)
-        self.declare_parameter('processing_rate_hz', 5.0)
+        self.declare_parameter('processing_rate_hz', 10.0)
         self.declare_parameter('tf_timeout_sec', 0.1)
         self.declare_parameter('world_frame_suffix', 'world_origin')
-        self.declare_parameter('kf_process_noise_pos', 0.5)   # Q_pos
-        self.declare_parameter('kf_process_noise_vel', 1.0)   # Q_vel
-        self.declare_parameter('kf_process_noise_acc', 2.0)   # Q_acc (higher = faster adaptation to manoeuvres)
+        self.declare_parameter('kf_process_noise_acc', 1.5)   # white-jerk std for CA model
+        self.declare_parameter('kf_process_noise_vel', 0.5)   # white-accel std for CV model
+        self.declare_parameter('imm_transition_prob', 0.95)
         self.declare_parameter('kf_measurement_noise', 0.05)  # R
+        self.declare_parameter('kf_adaptive_cov_max_multiplier', 50.0)
         self.declare_parameter('kf_initial_covariance', 10.0)
-        self.declare_parameter('kf_prediction_horizon_sec', 2.0)  # seconds ahead to predict
+        self.declare_parameter('kf_prediction_horizon_sec', 1.0)  # seconds ahead to predict
         self.declare_parameter('kf_prediction_steps', 25)          # path samples over the horizon
 
         self.observer1_name = str(self.get_parameter('observer1_name').value)
@@ -212,10 +459,11 @@ class TestYolov8MultiViewTriangulationNode(Node):
         self.processing_rate_hz = max(0.5, float(self.get_parameter('processing_rate_hz').value))
         self.tf_timeout_sec = float(self.get_parameter('tf_timeout_sec').value)
         self.world_frame_suffix = str(self.get_parameter('world_frame_suffix').value)
-        self.kf_process_noise_pos = float(self.get_parameter('kf_process_noise_pos').value)
-        self.kf_process_noise_vel = float(self.get_parameter('kf_process_noise_vel').value)
         self.kf_process_noise_acc = float(self.get_parameter('kf_process_noise_acc').value)
+        self.kf_process_noise_vel = float(self.get_parameter('kf_process_noise_vel').value)
+        self.imm_transition_prob = float(self.get_parameter('imm_transition_prob').value)
         self.kf_measurement_noise = float(self.get_parameter('kf_measurement_noise').value)
+        self.kf_adaptive_cov_max_multiplier = float(self.get_parameter('kf_adaptive_cov_max_multiplier').value)
         self.kf_initial_covariance = float(self.get_parameter('kf_initial_covariance').value)
         self.kf_prediction_horizon_sec = float(self.get_parameter('kf_prediction_horizon_sec').value)
         self.kf_prediction_steps = max(5, int(self.get_parameter('kf_prediction_steps').value))
@@ -239,22 +487,26 @@ class TestYolov8MultiViewTriangulationNode(Node):
         self.last_processed_image_stamp_ns: Dict[str, int] = {r: -1 for r in self.observer_roles}
         self.target_gt_odom: Optional[Odometry] = None
 
-        # --- Linear Kalman Filter (constant-acceleration model, CA) ---
-        # State: [px, py, pz, vx, vy, vz, ax, ay, az],  Measurement: [px, py, pz]
-        A0 = np.eye(9, dtype=np.float64)        # updated with dt before each predict
-        B0 = np.zeros((9, 1), dtype=np.float64)  # no control input
-        H0 = np.zeros((3, 9), dtype=np.float64)
-        H0[0, 0] = H0[1, 1] = H0[2, 2] = 1.0
-        self.kf = LinearKalmanFilter(A0, B0, H0)
-        self.kf_Q = np.diag([
-            self.kf_process_noise_pos, self.kf_process_noise_pos, self.kf_process_noise_pos,
-            self.kf_process_noise_vel, self.kf_process_noise_vel, self.kf_process_noise_vel,
-            self.kf_process_noise_acc, self.kf_process_noise_acc, self.kf_process_noise_acc,
-        ])
-        self.kf_R = np.eye(3, dtype=np.float64) * self.kf_measurement_noise
-        self.kf_u = np.zeros(1, dtype=np.float64)
-        self.kf_sc: Optional[StateCov] = None
-        self.kf_last_stamp_ns: Optional[int] = None
+        # --- Interacting Multiple Model (IMM) Filter ---
+        p_stay = self.imm_transition_prob
+        p_switch = 1.0 - p_stay
+        # Asymmetric pi to favor CA staying active during circular maneuvers
+        # CV -> CV, CV -> CA
+        # CA -> CV (harder to drop out of curve), CA -> CA (easier to maintain curve)
+        pi = np.array([
+            [p_stay, p_switch],
+            [p_switch * 0.5, 1.0 - (p_switch * 0.5)]
+        ], dtype=np.float64)
+        mu0 = np.array([0.5, 0.5], dtype=np.float64)
+        
+        self.imm = IMMFilter(pi, mu0)
+        self.imm_initialized = False
+        self.imm_last_stamp_ns: Optional[int] = None
+        self.filtered_position = np.zeros(3)
+        self.filtered_velocity = np.zeros(3)
+        self.filtered_acceleration = np.zeros(3)
+        self.combined_cov = np.eye(9)
+        self.imm_probs = mu0.copy()
 
         self.last_error_log_time = time.time()
         self.frame_counter = 0
@@ -479,27 +731,58 @@ class TestYolov8MultiViewTriangulationNode(Node):
         stamp_ns = max(obs1.stamp_ns, obs2.stamp_ns)
         measurement = midpoint
 
-        # --- KF predict + correct ---
-        if self.kf_sc is None:
-            x0 = np.zeros(9, dtype=np.float64)
-            x0[:3] = measurement
-            P0 = np.eye(9, dtype=np.float64) * self.kf_initial_covariance
-            self.kf_sc = StateCov(x=x0, P=P0)
-            self.kf_last_stamp_ns = stamp_ns
+        # --- Adaptive Measurement Covariance ---
+        # Calculate angle between the two rays to scale depth uncertainty
+        cos_angle = np.clip(np.dot(dir1, dir2), -1.0, 1.0)
+        angle_rad = np.arccos(cos_angle)
+        sin_angle = np.clip(np.sin(angle_rad), 1e-6, 1.0)
+        
+        # Bisector points roughly towards the target from the midpoint between cameras
+        bisector = normalize(dir1 + dir2)
+        
+        # Base variance
+        var_base = self.kf_measurement_noise
+        # Depth variance increases sharply when rays are nearly parallel
+        multiplier = min(1.0 / sin_angle, self.kf_adaptive_cov_max_multiplier)
+        var_depth = var_base * multiplier
+        
+        # Construct R matrix: var_depth along bisector, var_base orthogonal to it
+        v_diff = normalize(dir1 - dir2)
+        v_cross = normalize(np.cross(bisector, v_diff))
+        
+        P_eig = np.array([
+            [var_depth, 0.0, 0.0],
+            [0.0, var_base, 0.0],
+            [0.0, 0.0, var_base]
+        ])
+        Evecs = np.column_stack((bisector, v_diff, v_cross))
+        R = Evecs @ P_eig @ Evecs.T
+
+        # --- IMM predict + correct ---
+        if not self.imm_initialized:
+            self.imm.initialize(measurement, self.kf_initial_covariance)
+            self.imm_initialized = True
+            self.imm_last_stamp_ns = stamp_ns
+            self.combined_cov = np.eye(9) * self.kf_initial_covariance
+            self.filtered_position = measurement.copy()
         else:
-            dt = (stamp_ns - self.kf_last_stamp_ns) / 1_000_000_000.0
+            dt = (stamp_ns - self.imm_last_stamp_ns) / 1_000_000_000.0
             if dt > 0.0:
-                self.kf.A = build_transition_matrix(dt)
-                self.kf_sc = self.kf.predict(self.kf_sc, self.kf_u, self.kf_Q, dt)
-                self.kf_last_stamp_ns = stamp_ns
-        self.kf_sc = self.kf.correct(self.kf_sc, measurement, self.kf_R)
+                Q_cv = build_process_noise_cv(dt, self.kf_process_noise_vel)
+                Q_ca = build_process_noise_ca(dt, self.kf_process_noise_acc)
+                # Threshold 9.0 corresponds to chi-square distribution for 3 DOF at ~97% confidence.
+                x_comb, self.combined_cov, self.imm_probs, accepted = self.imm.predict_and_correct(dt, Q_cv, Q_ca, measurement, R, mahalanobis_thresh=9.0)
+                
+                if not accepted:
+                    self.get_logger().warn(f"Outlier measurement rejected by Mahalanobis gating! Filter coasting purely on kinetics.")
+                
+                self.filtered_position = x_comb[:3].copy()
+                self.filtered_velocity = x_comb[3:6].copy()
+                self.filtered_acceleration = x_comb[6:9].copy()
+                self.imm_last_stamp_ns = stamp_ns
 
-        filtered_position     = self.kf_sc.x[:3].copy()
-        filtered_velocity     = self.kf_sc.x[3:6].copy()
-        filtered_acceleration = self.kf_sc.x[6:9].copy()
-
-        self.publish_pose_estimate(filtered_position, filtered_velocity, filtered_acceleration, stamp_ns)
-        self.publish_ground_truth_error(filtered_position, stamp_ns)
+        self.publish_pose_estimate(self.filtered_position, self.filtered_velocity, self.filtered_acceleration, stamp_ns)
+        self.publish_ground_truth_error(self.filtered_position, stamp_ns)
 
     def pixel_to_world_ray(
         self,
@@ -564,8 +847,8 @@ class TestYolov8MultiViewTriangulationNode(Node):
         pose_msg.pose.orientation.w = 1.0
         self.pose_pub.publish(pose_msg)
 
-        # Covariance from KF state (if available)
-        P = self.kf_sc.P if self.kf_sc is not None else np.eye(9)
+        # Covariance from IMM combined state
+        P = self.combined_cov
 
         odom_msg = Odometry()
         odom_msg.header = pose_msg.header
@@ -604,11 +887,46 @@ class TestYolov8MultiViewTriangulationNode(Node):
 
         dt_step = self.kf_prediction_horizon_sec / self.kf_prediction_steps
         pred_points: List[np.ndarray] = []
-        for i in range(self.kf_prediction_steps + 1):
-            t = i * dt_step
-            pred_pos = position + velocity * t + 0.5 * acceleration * (t * t)
-            pred_points.append(pred_pos)
+        
+        # --- IMM Fading Acceleration Prediction ---
+        # We iteratively predict the Markov probabilities (mu) and the independent states
+        # forward in time. This causes the acceleration from CA to naturally decay 
+        # towards zero if the transition pulls the model back to CV over the long horizon.
+        
+        # Initial states and probabilities for extrapolation
+        if hasattr(self, 'imm') and self.imm_initialized:
+            cur_mu = self.imm.mu.copy()
+            x_cv = self.imm.sc_cv.x.copy()
+            x_ca = self.imm.sc_ca.x.copy()
+            pi_t = self.imm.pi.T
+            
+            A_cv = build_transition_matrix_cv(dt_step)
+            A_ca = build_transition_matrix_ca(dt_step)
+            
+            for i in range(self.kf_prediction_steps + 1):
+                # Calculate combined position at current step
+                pos_cv = x_cv[:3]
+                pos_ca = x_ca[:3]
+                pred_pos = pos_cv * cur_mu[0] + pos_ca * cur_mu[1]
+                pred_points.append(pred_pos)
+                
+                # Advance step
+                x_cv = A_cv @ x_cv
+                x_ca = A_ca @ x_ca
+                # CRITICAL FIX: Freeze the `cur_mu` for the visual prediction! 
+                # Decaying `cur_mu` causes fading acceleration which artificially straightens the curve.
+                # By freezing it, if the filter currently believes it's turning (CA is high), 
+                # it will draw a full, unbroken curved arc for the entire 1.5 seconds.
+                # cur_mu = pi_t @ cur_mu
+        else:
+            # Fallback for generic CA
+            for i in range(self.kf_prediction_steps + 1):
+                t = i * dt_step
+                pred_pos = position + velocity * t + 0.5 * acceleration * (t * t)
+                pred_points.append(pred_pos)
 
+        for i, pred_pos in enumerate(pred_points):
+            t = i * dt_step
             pred_stamp_ns = stamp_ns + int(t * 1_000_000_000)
             pose = PoseStamped()
             pose.header.frame_id = self.target_frame_id

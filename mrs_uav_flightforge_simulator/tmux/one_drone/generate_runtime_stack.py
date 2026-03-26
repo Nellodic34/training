@@ -97,8 +97,7 @@ def build_auto_start_window(node_cfg):
             'observer1_name': node_cfg['observer1_name'],
             'observer2_name': node_cfg['observer2_name'],
             'target_name': node_cfg['target_name'],
-            'kf_process_noise_pos': node_cfg['kf_process_noise_pos'],
-            'kf_process_noise_vel': node_cfg['kf_process_noise_vel'],
+            'kf_process_noise_acc': node_cfg['kf_process_noise_acc'],
             'kf_measurement_noise': node_cfg['kf_measurement_noise'],
             'kf_initial_covariance': node_cfg['kf_initial_covariance'],
         }
@@ -322,8 +321,7 @@ def main() -> int:
     observer1_name = str(uav_roles_cfg.get('observer1', 'uav1'))
     observer2_name = str(uav_roles_cfg.get('observer2', 'uav2'))
     target_name = str(uav_roles_cfg.get('target', 'uav3'))
-    kf_process_noise_pos = float(ekf_cfg.get('kf_process_noise_pos', 0.5))
-    kf_process_noise_vel = float(ekf_cfg.get('kf_process_noise_vel', 1.0))
+    kf_process_noise_acc = float(ekf_cfg.get('kf_process_noise_acc', 1.0))
     kf_measurement_noise = float(ekf_cfg.get('kf_measurement_noise', 0.05))
     kf_initial_covariance = float(ekf_cfg.get('kf_initial_covariance', 10.0))
 
@@ -378,8 +376,7 @@ def main() -> int:
         'observer1_name': observer1_name,
         'observer2_name': observer2_name,
         'target_name': target_name,
-        'kf_process_noise_pos': kf_process_noise_pos,
-        'kf_process_noise_vel': kf_process_noise_vel,
+        'kf_process_noise_acc': kf_process_noise_acc,
         'kf_measurement_noise': kf_measurement_noise,
         'kf_initial_covariance': kf_initial_covariance,
     }
@@ -406,8 +403,7 @@ def main() -> int:
                 f"OBSERVER1_NAME='{observer1_name}'",
                 f"OBSERVER2_NAME='{observer2_name}'",
                 f"TARGET_NAME='{target_name}'",
-                f"KF_PROCESS_NOISE_POS='{kf_process_noise_pos}'",
-                f"KF_PROCESS_NOISE_VEL='{kf_process_noise_vel}'",
+                f"KF_PROCESS_NOISE_ACC='{kf_process_noise_acc}'",
                 f"KF_MEASUREMENT_NOISE='{kf_measurement_noise}'",
                 f"KF_INITIAL_COVARIANCE='{kf_initial_covariance}'",
             ]

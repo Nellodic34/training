@@ -1,0 +1,54 @@
+{
+  "proposed": {
+    "count": 563,
+    "ade_m": 0.9509935988113871,
+    "fde_m": 2.0127157657241486,
+    "max_error_m": 2.014339073136022,
+    "position_rmse_m": 1.4402490380062691,
+    "velocity_rmse_m": 1.2395062349804207
+  },
+  "baseline": {
+    "count": 0,
+    "ade_m": null,
+    "fde_m": null,
+    "max_error_m": null,
+    "position_rmse_m": null,
+    "velocity_rmse_m": null
+  },
+  "improvement_percent": {},
+  "known_trajectory_model": {
+    "proposed": {
+      "count": 542,
+      "ade_m": 0.9396298924384086,
+      "fde_m": 2.096489011584891,
+      "max_error_m": 2.098171018610155,
+      "position_rmse_m": 1.4231755153587542,
+      "velocity_rmse_m": 1.2511772109221224
+    },
+    "baseline": {
+      "count": 0,
+      "ade_m": null,
+      "fde_m": null,
+      "max_error_m": null,
+      "position_rmse_m": null,
+      "velocity_rmse_m": null
+    },
+    "improvement_percent": {}
+  },
+  "ground_truth_vs_known_trajectory": {
+    "count": 6513,
+    "mean_error_m": 0.06146407322593233,
+    "max_error_m": 0.3978404644100565
+  },
+  "rviz_topics": {
+    "predicted_trajectory": "/target/predicted_trajectory"
+  },
+  "artifacts": {
+    "json": "/home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/debug/evaluation/20260317_125049/prediction_eval.json",
+    "plot": "/home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/debug/evaluation/20260317_125049/prediction_eval_plot.png",
+    "xy_plot": "/home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/debug/evaluation/20260317_125049/prediction_eval_xy.png",
+    "xyz_plot": "/home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/debug/evaluation/20260317_125049/prediction_eval_xyz.png",
+    "report": "/home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/debug/evaluation/20260317_125049/prediction_eval_report.md",
+    "csv": "/home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/debug/evaluation/20260317_125049/prediction_eval_samples.csv"
+  }
+}

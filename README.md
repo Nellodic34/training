@@ -74,7 +74,10 @@ export FLIGHTFORGE_DIR=/path/to/your/FlightForge_Linux_vX_Y_Z/Linux
     │  • YOLOv8 detection ×2   │
     │  • bearing ray extraction│
     │  • midpoint triangulation│
-    │  • velocity estimation   │
+    │  • IMM filter (CV + CA)  │
+    │  • adaptive covariance R │
+    │  • Mahalanobis gating    │
+    │  • predicted trajectory  │
     │  • GT error computation  │
     └────────────┬─────────────┘
                  │
@@ -324,6 +327,9 @@ cd ~/git/training/mrs_uav_flightforge_simulator/tmux/one_drone
 | `/target/odometry_estimate` | `nav_msgs/Odometry` | Position + estimated velocity |
 | `/target/position_estimate` | `geometry_msgs/Vector3Stamped` | Position as (x, y, z) |
 | `/target/position_error` | `geometry_msgs/Vector3Stamped` | Error vs ground truth (dx, dy, dz) |
+| `/target/predicted_trajectory` | `nav_msgs/Path` | IMM predicted trajectory over the configured horizon |
+| `/target/predicted_trajectory_markers` | `visualization_msgs/MarkerArray` | Arrow markers for predicted trajectory in RViz |
+| `/target/position_markers` | `visualization_msgs/MarkerArray` | Estimated (blue) and GT (green) position markers |
 
 ### Published by the single-view detection node
 
@@ -379,6 +385,42 @@ ros2 run rqt_plot rqt_plot \
   /target/position_estimate/vector/y \
   /target/position_estimate/vector/z
 ```
+
+### RViz overlays for prediction
+
+To visualize the forward prediction in RViz, add:
+
+- `Path`: `/target/predicted_trajectory`
+- `MarkerArray`: `/target/predicted_trajectory_markers`
+- `MarkerArray`: `/target/position_markers`
+
+---
+
+## Prediction Evaluation
+
+The evaluation node in `tmux/one_drone/dataset_tools/evaluate_prediction_node.py` computes final metrics and plots when stopped with `Ctrl+C`.
+
+Run with:
+
+```bash
+cd ~/git/training/mrs_uav_flightforge_simulator/tmux/one_drone
+./run_prediction_evaluation.sh
+```
+
+Generated outputs (default under `tmux/one_drone/debug/evaluation/<timestamp>/`):
+
+- `prediction_eval.json`
+- `prediction_eval_plot.png`
+- `prediction_eval_xy.png`
+- `prediction_eval_report.md`
+- `prediction_eval_samples.csv`
+
+Current evaluator behavior:
+
+- metrics and plots computed on circular phase only
+- comparison vs ground truth and vs known trajectory model
+- metrics: position error, RMSE position, velocity error, RMSE velocity, horizon-based prediction error
+- dedicated XY plot with known circle + proposed predictions + observer markers
 
 > **Note:** always `source /opt/ros/jazzy/setup.bash` and `source local_setup.bash` before using `ros2` commands.
 

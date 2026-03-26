@@ -418,3 +418,26 @@ Per confronto tesi pulito:
 4. confronta anche i plot XY e i worst cases del report
 5. riporta miglioramento `%` su ADE/FDE/MAX error
 
+
+#Workflow addestramento YOLO
+
+ros2 run trajectory_planner uav_simple_traj --ros-args -p uav_name:=uav2
+
+python3 collect_yolo_dataset_node.py --ros-args \
+  -p output_dir:=$HOME/datasets/uav_detector \
+
+yolo detect train \
+  data=$HOME/dataset_merged/dataset.yaml \
+  model=yolov8n.pt \
+  imgsz=960 \
+  epochs=100 \
+  batch=16 \
+  name=drone_detector_n_960
+
+yolo detect val \
+  data=$HOME/dataset_merged/dataset.yaml \
+  model=runs/detect/drone_detector_n_960/weights/best.pt \
+  imgsz=960
+
+il deploy va modificato nel file triangulation
+yolo export model=runs/detect/drone_detector_n_960/weights/best.pt format=onnx imgsz=960

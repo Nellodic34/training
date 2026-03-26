@@ -1,0 +1,136 @@
+# Guida Definitiva: L'Interacting Multiple Model (IMM) Filter Attuale
+
+Questo documento analizza riga per riga l'ultimo stadio dell'oggetto [IMMFilter](file:///home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/dataset_tools/test_yolov8_multiview_triangulation_node.py#198-372) all'interno di [test_yolov8_multiview_triangulation_node.py](file:///home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/dataset_tools/test_yolov8_multiview_triangulation_node.py). Il suo scopo è tracciare dinamicamente un bersaglio 3D scegliendo e sfumando costantemente tra due regimi:
+1. **Constant Velocity (CV)**: Assume che il drone voli dritto. Non possiede accelerazione nel suo stato (`[px, py, pz, vx, vy, vz]`).
+2. **Constant Acceleration (CA)**: Assume che il drone stia curvando o accelerando. Possiede l'accelerazione nel suo stato (`[px, py, pz, vx, vy, vz, ax, ay, az]`).
+
+Il trucco magico dell'IMM risiede nel tenere in vita entrambi i filtri simultaneamente, scambiandosi informazioni a ogni fotogramma per capire quale ha più probabilità di avere ragione, basandosi su quanto bene riescono a prevedere il prossimo dato ottico di YOLO.
+
+---
+
+## 1. Probabilità Asimmetriche di Transizione (La matrice di Markov [pi](file:///home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/dataset_tools/collect_yolo_dataset_node.py#282-304))
+
+Prima ancora di iniziare il giro di calcoli, l'IMM dichiara la sua "psicologia" usando la matrice di transizione di Markov [pi](file:///home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/dataset_tools/collect_yolo_dataset_node.py#282-304):
+
+```python
+        p_stay = self.imm_transition_prob  # 0.90
+        p_switch = 1.0 - p_stay            # 0.10
+        pi = np.array([
+            [p_stay, p_switch],
+            [p_switch * 0.1, 1.0 - (p_switch * 0.1)]
+        ], dtype=np.float64)
+```
+
+**Significato:** `pi[i, j]` indica la probabilità di passare dal modello `i` al modello `j` in 1 decimo di secondo (se `dt`=0.1s).
+- **CV -> CV**: c'è il 90% di probabilità che, se il drone va dritto, continuerà ad andare dritto.
+- **CV -> CA**: c'è il 10% di probabilità che, all'improvviso, inizi una curva o una brusca accelerazione.
+- **CA -> CV (`p_switch * 0.1 = 0.01`)**: Se il drone è GIA' in curva (modello CA), la matrice gli dice che ha solo l'1% di probabilità per fotogramma di "rompere" l'arco e tornare improvvisamente dritto.
+- **CA -> CA**: C'è il 99% di probabilità di restare nella curva.
+
+Questo design **asimmetrico** è fondamentale per le traiettorie miste e per l'otto: una volta che il CA vince l'attrito iniziale ed entra in curva, viene incoraggiato fortemente a restarci dentro, evitando i singhiozzi "curva/svirgola/dritto" dovuti al rumore della telecamera.
+
+---
+
+## 2. Il Ciclo di Vita (metodo [predict_and_correct](file:///home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/dataset_tools/test_yolov8_multiview_triangulation_node.py#259-348))
+
+A ogni nuovo frame della telecamera catturato con successo, chiamiamo [predict_and_correct(...)](file:///home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/dataset_tools/test_yolov8_multiview_triangulation_node.py#259-348). Seguiamo i 4 step cruciali:
+
+### Step 1: Lo scambio di energie (Mixing)
+
+Essendo filtri "interconnessi", non procedono in isolamento. Ognuno dei due filtri (il Dritto e il Curvo) fa partire la propria previsione mischiando un pezzo del proprio passato con un pezzo del passato dell'altro.
+
+```python
+    c_bar = self.pi.T @ self.mu  # c_bar[j] è la probabilità totale predetta che domini il modello j
+```
+Vengono calcolate le `mu_mix` (probabilità condizionate), cioè: "sapendo che ora sono il Modello CV, quanta fetta del mio stato di partenza devo prendere dal mio stato di 1 decimo di secondo fa, e quanta dal CA?".
+
+```python
+    x_ca_as_cv = self._state_ca_to_cv(x_ca)
+    x_cv_as_ca = self._state_cv_to_ca(x_cv)
+    x_cv_as_ca[6:9] = x_ca[6:9]  # CRITICAL FIX
+```
+Qui si allineano matematicamente i due vettori di stato rendendoli della stessa taglia per poterli sommare. 
+Il CV (6-D) viene "pompato" artificialmente a 9 dimensioni per mescolarsi al CA. Siccome un modello a Velocità Costante ha per definizione una accelerazione nulla `[0,0,0]`, se lo iniettassimo brutalmente all'interno del CA, "diluiremmo" la memoria di accelerazione del CA fino a zero! 
+Questa riga salva la vita alle curve: quando il CV cede il suo stato "dritto" al CA, gli permette di **ereditare intatta l'ultima accelerazione misurata dal CA**. Così, appena YOLO individua una curva, il CA "scatta" a razzo essendo già pre-caricato dell'accelerazione centrifuga!
+
+```python
+    x0_mix_cv = x_cv * mu_mix[0, 0] + x_ca_as_cv * mu_mix[1, 0]
+    self.sc_cv.x = x0_mix_cv  # cv rinasce "sporco" di energia del ca
+```
+
+### Step 2: La Previsione Fisica (Prediction)
+Ora che si sono mescolati, i due modelli operano indipendentemente usando i propri modelli cinematici canonici di Kalman pre-applicando le matrici di rumore fisico di volo `Q` (`Q_cv=2.0` accel-limite, `Q_ca=1.0` jerk-limite).
+
+```python
+    self.kf_cv.A = build_transition_matrix_cv(dt)
+    sc_pred_cv = self.kf_cv.predict(self.sc_cv, u_cv, Q_cv, dt)
+```
+Il CV fa viaggiare il suo centroide in linea retta per `dt` secondi. E la sua nuvola di incertezza (matrice `P`) si allarga orizzontalmente in base al suo basso `Q_cv` (ora a 1.5/2.0).
+Similmente fa il CA, ma percorrendo con matematica Galileiana la sua parabola `v*t + 1/2 a*t^2`.
+
+### Step 3: Giudizio in Tribunale (Likelihood & Gating)
+A questo punto YOLO dice: "Sto vedendo il drone nel punto `z`".
+
+```python
+    y_cv = z - self.kf_cv.H @ sc_pred_cv.x # Errore: quanto si è sbagliato il modello Dritto?
+    y_ca = z - self.kf_ca.H @ sc_pred_ca.x # Errore: quanto si è sbagliato il modello Curvo?
+```
+
+Questi errori (`y`) passano in un primissimo muro di sicurezza, detto **Mahalanobis Distance Gating**:
+```python
+    d_cv = float(y_cv.T @ invS_cv_true @ y_cv)
+    if d_cv > 16.27 and d_ca > 16.27:
+        # Rejected!
+        self.sc_cv = sc_pred_cv
+        return x_comb, False
+```
+Se la distanza dell'errore (pesata rispetto all'angolazione del rumore e scalata dai modelli statistici Chi-Quadro) supera la soglia estrema di `16.27`, cioè se il dato è *"al 99.9% fuori dalla normalità cinetica di un quadricottero"*, l'IMM abortisce la lettura! Questa riga ignora i classici "salti falsi / glitch" di una triangolazione sfasata. Restituisce il valore puramente predetto dalla fisica senza sporcarsi mai col pixel sbagliato, preservando le curve lisce.
+
+Se l'errore rientra nella norma, si estraggono i pesi:
+```python
+    def mv_normal_pdf_fixed(y, S_fixed):
+        invS = np.linalg.inv(S_fixed)
+        exponent = -0.5 * y.T @ invS @ y
+        return float(np.exp(max(-50.0, min(50.0, exponent))))
+
+    Lambda = np.array([mv_normal_pdf_fixed(y_cv, R), mv_normal_pdf_fixed(y_ca, R)])
+```
+Questa è la formula della campana asimmetrica Gaussiana. Viene passata *allo stesso identico rumore ottico standard R*. Questo significa che la "gara" tra i due filtri viene vinta puramente da chi si è piazzato spazialmente (distanza Mahalanobis) più vicino al bersaglio vero `z`.
+- Se in quel decimo di secondo il drone si muoveva dritto, `y_cv` (errore retta) sarà 1 centimetro, mentre `y_ca` (che provava a chiudere inutilmente una parabola) sarà 5 cm. Il calcolo esponenziale esalterà `Lambda_cv`.
+- Se il drone stava in curva (nell'Otto), la parabola del CA calcolerà perfettamente la traiettoria e atterrerà a 1 cm dal drone. Il CV, "tirando dritto tangenzialmente", se ne sfalserà di 10 cm. Il calcolo esponenziale esalterà verticalmente `Lambda_ca`.
+
+### Step 4: Aggiornamento delle Probabilità e Fusione
+Ora abbiamo `Lambda` (quanto ogni modello meritava in questo singolo frazione di secondo) e li combiniamo con il "pensionamento" (`c_bar` Markoviano della matrice asimmetrica iniziale):
+```python
+    self.mu = Lambda * c_bar
+    self.mu /= np.sum(self.mu) + 1e-12
+```
+Se `mu[0]` è 0.02 (2%) e `mu[1]` è 0.98 (98%), abbiamo **certezza matematica logica che stiamo curvando**.
+
+Si calcolano le correzioni di Kalman e infine si scodella fuori nel mondo il vettore combinato per questo fotogramma:
+```python
+    x_comb = self._state_cv_to_ca(self.sc_cv.x) * self.mu[0] + self.sc_ca.x * self.mu[1]
+```
+Lo stato `x_comb` in uscita (spedito su ROS e visualizzato col pallino blu se ricordo bene i colori) non è mai "o un modello o l'altro": è fisicamente la media ponderata in tempo reale del modello a velocità costante col modello in curva.
+
+---
+
+## 3. Disegnare le Frecce del Futuro ([_publish_predicted_trajectory](file:///home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/dataset_tools/test_yolov8_multiview_triangulation_node.py#615-691))
+
+Avendo sviscerato l'estrazione combinata (`x_comb`), tu sai anche che nel nodo la traiettoria disegnata "rossa" viene generata in una funzione specifica. Questa iterava estrapolando i dati a vuoto per 1.5 secondi tramite il calcolo fisico del CA fisso: 
+`pred_pos = position + velocity * t + 0.5 * acceleration * (t * t)`
+Il problema? Nel caso dell'IMM attuale, le predizioni future mantenevano questo approccio statico. Noi volevamo un semiarco "perfetto" che si fondesse per magia nella circonferenza di 1.5s, ed è stato inserito il "Freeze Probability":
+
+Nel for:
+```python
+    pos_cv = x_cv[:3]
+    pos_ca = x_ca[:3]
+    pred_pos = pos_cv * cur_mu[0] + pos_ca * cur_mu[1]
+    
+    x_cv = A_cv @ x_cv
+    x_ca = A_ca @ x_ca
+    # cur_mu = pi_t @ cur_mu (DISABILITATO)
+```
+
+Invece di far sfumare l'accelerazione facendo precipitare matematicamente nel futuro quel `98%` verso il `50%` canonico in preda all'entropia asimmetrica... la linea ROSSA estrapola mantenendo in maniera fissa la percentuale attuale di curva (`cur_mu`). 
+"Se so di curvare, immagino fortemente che il target curvi per sempre in quest'orbita perfetta" è il principio guida del test, tenendo solida la previsione e incollato saldamente il filo rosso alla strada verde a terra per 1.5s di scorrimento.

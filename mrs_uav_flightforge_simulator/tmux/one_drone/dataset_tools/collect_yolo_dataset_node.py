@@ -57,7 +57,7 @@ class CollectYoloDatasetNode(Node):
         self.declare_parameter('class_id', 0)
         self.declare_parameter('sample_every_n_frames', 5)
         self.declare_parameter('target_class_name', 'drone')
-        self.declare_parameter('target_diameter_m', 0.7)
+        self.declare_parameter('target_diameter_m', 0.5)
         self.declare_parameter('bbox_scale', 1.25)
         self.declare_parameter('min_bbox_size_px', 12.0)
         self.declare_parameter('max_bbox_size_px', 700.0)

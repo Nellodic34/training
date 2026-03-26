@@ -60,14 +60,18 @@ class PredictionEvaluatorNode(Node):
         self.declare_parameter('proposed_path_topic', '/target/predicted_trajectory')
         self.declare_parameter('baseline_path_topic', '')
         self.declare_parameter('stamp_tolerance_sec', 0.08)
+        self.declare_parameter('anees_stamp_tolerance_sec', 0.10)
         self.declare_parameter('max_pending_age_sec', 6.0)
         self.declare_parameter('report_every_n_paths', 25)
         self.declare_parameter('output_dir', str(default_output_dir))
         self.declare_parameter('output_json_path', '')
         self.declare_parameter('output_plot_path', '')
         self.declare_parameter('output_xy_plot_path', '')
+        self.declare_parameter('output_xyz_plot_path', '')
         self.declare_parameter('output_report_path', '')
         self.declare_parameter('output_csv_path', '')
+        self.declare_parameter('known_path_topic', '/target/known_trajectory_path')
+        self.declare_parameter('estimate_odom_topic', '/target/odometry_estimate')
 
         self.declare_parameter('enable_known_trajectory_model', True)
         self.declare_parameter('model_initial_offset_x', 3.0)
@@ -84,6 +88,7 @@ class PredictionEvaluatorNode(Node):
         self.proposed_path_topic = str(self.get_parameter('proposed_path_topic').value)
         self.baseline_path_topic = str(self.get_parameter('baseline_path_topic').value)
         self.stamp_tolerance_ns = int(float(self.get_parameter('stamp_tolerance_sec').value) * 1e9)
+        self.anees_stamp_tolerance_ns = int(float(self.get_parameter('anees_stamp_tolerance_sec').value) * 1e9)
         self.max_pending_age_ns = int(float(self.get_parameter('max_pending_age_sec').value) * 1e9)
         self.report_every_n_paths = max(1, int(self.get_parameter('report_every_n_paths').value))
 
@@ -111,8 +116,11 @@ class PredictionEvaluatorNode(Node):
         json_stem = json_path.with_suffix('') if json_path.suffix else FsPath(f'{self.output_json_path}_summary')
         self.output_plot_path = str(self.get_parameter('output_plot_path').value) or f'{json_stem}_plot.png'
         self.output_xy_plot_path = str(self.get_parameter('output_xy_plot_path').value) or f'{json_stem}_xy.png'
+        self.output_xyz_plot_path = str(self.get_parameter('output_xyz_plot_path').value) or f'{json_stem}_xyz.png'
         self.output_report_path = str(self.get_parameter('output_report_path').value) or f'{json_stem}_report.md'
         self.output_csv_path = str(self.get_parameter('output_csv_path').value) or f'{json_stem}_samples.csv'
+        self.known_path_topic = str(self.get_parameter('known_path_topic').value)
+        self.estimate_odom_topic = str(self.get_parameter('estimate_odom_topic').value)
 
         self.gt_history: Dict[int, np.ndarray] = {}
         self.pending: List[PendingPrediction] = []
@@ -169,15 +177,28 @@ class PredictionEvaluatorNode(Node):
         self.model_initial_position: Optional[np.ndarray] = None
         self.model_frame_id: str = ''
         self.gt_velocity_history: Dict[int, np.ndarray] = {}
+        self.estimate_position_history: Dict[int, np.ndarray] = {}
+        self.estimate_cov_history: Dict[int, np.ndarray] = {}
+        self.known_path_stamps_ns: List[int] = []
+        self.known_path_positions: List[np.ndarray] = []
         self.observer_positions: Dict[str, Optional[np.ndarray]] = {'observer1': None, 'observer2': None}
         self.gt_model_error_sum: float = 0.0
         self.gt_model_error_count: int = 0
         self.gt_model_error_max: float = 0.0
+        self.anees_sum: float = 0.0
+        self.anees_count: int = 0
+        self.anees_max: float = 0.0
+        self.estimate_msg_count: int = 0
+        self.anees_unmatched_count: int = 0
 
         self.create_subscription(Odometry, self.gt_odom_topic, self.gt_callback, 100)
+        if self.estimate_odom_topic.strip():
+            self.create_subscription(Odometry, self.estimate_odom_topic, self.estimate_odom_callback, 100)
         self.create_subscription(Path, self.proposed_path_topic, self.proposed_path_callback, 20)
         if self.baseline_path_topic.strip():
             self.create_subscription(Path, self.baseline_path_topic, self.baseline_path_callback, 20)
+        if self.known_path_topic.strip():
+            self.create_subscription(Path, self.known_path_topic, self.known_path_callback, 10)
         if self.plot_observer_markers:
             if self.observer1_odom_topic.strip():
                 self.create_subscription(
@@ -207,11 +228,114 @@ class PredictionEvaluatorNode(Node):
         self.get_logger().info(f'Saving summary JSON to: {self.output_json_path}')
         self.get_logger().info(f'Saving final plot to: {self.output_plot_path}')
         self.get_logger().info(f'Saving XY comparison plot to: {self.output_xy_plot_path}')
+        self.get_logger().info(f'Saving XYZ comparison plot to: {self.output_xyz_plot_path}')
         self.get_logger().info(f'Saving final report to: {self.output_report_path}')
         self.get_logger().info(f'Saving per-sample CSV to: {self.output_csv_path}')
+        self.get_logger().info(f'Known trajectory input topic: {self.known_path_topic}')
+        self.get_logger().info(f'Estimate odometry topic (ANEES): {self.estimate_odom_topic}')
+        self.get_logger().info(f'ANEES stamp tolerance: {self.anees_stamp_tolerance_ns / 1e9:.3f}s')
 
     def observer_callback(self, role: str, msg: Odometry) -> None:
         self.observer_positions[role] = vec3_from_pose(msg.pose.pose)
+
+    def known_path_callback(self, msg: Path) -> None:
+        poses = msg.poses
+        if not poses:
+            return
+
+        self.known_path_stamps_ns = [stamp_to_ns(p.header.stamp) for p in poses]
+        self.known_path_positions = [vec3_from_pose(p.pose) for p in poses]
+
+    def estimate_odom_callback(self, msg: Odometry) -> None:
+        t_ns = stamp_to_ns(msg.header.stamp)
+        pos = vec3_from_pose(msg.pose.pose)
+        self.estimate_msg_count += 1
+
+        cov = np.asarray(msg.pose.covariance, dtype=np.float64).reshape(6, 6)
+        cov_pos = cov[:3, :3].copy()
+
+        self.estimate_position_history[t_ns] = pos
+        self.estimate_cov_history[t_ns] = cov_pos
+
+        if len(self.estimate_position_history) > 20000:
+            keys = sorted(self.estimate_position_history.keys())
+            for k in keys[:5000]:
+                self.estimate_position_history.pop(k, None)
+                self.estimate_cov_history.pop(k, None)
+
+    def nearest_estimate_state(self, t_ns: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        if not self.estimate_position_history:
+            return None
+
+        keys = list(self.estimate_position_history.keys())
+        nearest_k = min(keys, key=lambda k: abs(k - t_ns))
+        if abs(nearest_k - t_ns) > self.anees_stamp_tolerance_ns:
+            return None
+
+        est_pos = self.estimate_position_history.get(nearest_k)
+        est_cov = self.estimate_cov_history.get(nearest_k)
+        if est_pos is None or est_cov is None:
+            return None
+        return est_pos, est_cov
+
+    def compute_nees_3d(self, error_vec: np.ndarray, cov_pos: np.ndarray) -> Optional[float]:
+        if error_vec.shape != (3,) or cov_pos.shape != (3, 3):
+            return None
+        if not np.all(np.isfinite(error_vec)) or not np.all(np.isfinite(cov_pos)):
+            return None
+
+        cov_sym = 0.5 * (cov_pos + cov_pos.T)
+        # Regularization keeps inversion stable when covariance is near-singular.
+        reg = cov_sym + np.eye(3, dtype=np.float64) * 1e-9
+
+        try:
+            solved = np.linalg.solve(reg, error_vec)
+            nees = float(error_vec.T @ solved)
+        except np.linalg.LinAlgError:
+            pinv = np.linalg.pinv(reg)
+            nees = float(error_vec.T @ pinv @ error_vec)
+
+        if not math.isfinite(nees) or nees < 0.0:
+            return None
+        return nees
+
+    def has_known_path(self) -> bool:
+        return len(self.known_path_positions) >= 2
+
+    def known_path_has_time(self) -> bool:
+        if len(self.known_path_stamps_ns) < 2:
+            return False
+        return max(self.known_path_stamps_ns) > min(self.known_path_stamps_ns)
+
+    def nearest_known_path_index(self, position: np.ndarray) -> Optional[int]:
+        if not self.known_path_positions:
+            return None
+        distances = [float(np.linalg.norm(position - p)) for p in self.known_path_positions]
+        return int(np.argmin(np.asarray(distances, dtype=np.float64)))
+
+    def known_path_position_at_time(self, t_ns: int) -> Optional[np.ndarray]:
+        if not self.has_known_path() or not self.known_path_has_time():
+            return None
+
+        stamps = self.known_path_stamps_ns
+        points = self.known_path_positions
+        if t_ns <= stamps[0]:
+            return points[0].copy()
+        if t_ns >= stamps[-1]:
+            return points[-1].copy()
+
+        for idx in range(1, len(stamps)):
+            t0 = stamps[idx - 1]
+            t1 = stamps[idx]
+            if t1 <= t0:
+                continue
+            if t_ns > t1:
+                continue
+            ratio = (t_ns - t0) / float(t1 - t0)
+            ratio = float(np.clip(ratio, 0.0, 1.0))
+            return points[idx - 1] + ratio * (points[idx] - points[idx - 1])
+
+        return points[-1].copy()
 
     def known_trajectory_position(self, t_ns: int) -> Optional[np.ndarray]:
         if not self.enable_known_trajectory_model:
@@ -324,20 +448,35 @@ class PredictionEvaluatorNode(Node):
         self.gt_history[t_ns] = gt_position
         self.gt_velocity_history[t_ns] = gt_velocity
 
+        est_state = self.nearest_estimate_state(t_ns)
+        if est_state is not None:
+            est_pos, est_cov = est_state
+            nees = self.compute_nees_3d(est_pos - gt_position, est_cov)
+            if nees is not None:
+                self.anees_sum += nees
+                self.anees_count += 1
+                self.anees_max = max(self.anees_max, nees)
+        else:
+            self.anees_unmatched_count += 1
+
         if self.enable_known_trajectory_model and self.model_t0_ns is None:
             self.model_t0_ns = t_ns
             self.model_initial_position = gt_position.copy()
             self.model_frame_id = msg.header.frame_id
 
         if self.enable_known_trajectory_model:
-            model_position = self.known_trajectory_position(t_ns)
+            model_position = None
+            if self.known_path_has_time():
+                model_position = self.known_path_position_at_time(t_ns)
+            elif self.has_known_path():
+                nearest_idx = self.nearest_known_path_index(gt_position)
+                if nearest_idx is not None:
+                    model_position = self.known_path_positions[nearest_idx].copy()
             if model_position is not None:
-                circle_start = self.circle_start_ns()
-                if circle_start is not None and t_ns >= circle_start:
-                    err = float(np.linalg.norm(gt_position - model_position))
-                    self.gt_model_error_sum += err
-                    self.gt_model_error_count += 1
-                    self.gt_model_error_max = max(self.gt_model_error_max, err)
+                err = float(np.linalg.norm(gt_position - model_position))
+                self.gt_model_error_sum += err
+                self.gt_model_error_count += 1
+                self.gt_model_error_max = max(self.gt_model_error_max, err)
 
         # keep history bounded
         if len(self.gt_history) > 20000:
@@ -382,18 +521,12 @@ class PredictionEvaluatorNode(Node):
         return self.gt_history[nearest_k]
 
     def evaluate_prediction(self, pred: PendingPrediction) -> Optional[EvaluatedPrediction]:
-        circle_start = self.circle_start_ns()
-        if circle_start is None:
-            return None
-
         errs: List[float] = []
         gt_positions: List[np.ndarray] = []
         filtered_stamps: List[int] = []
         filtered_pred_positions: List[np.ndarray] = []
 
         for t_ns, p in zip(pred.pose_stamps_ns, pred.positions):
-            if t_ns < circle_start:
-                continue
             gt_p = self.nearest_gt_position(t_ns)
             if gt_p is None:
                 return None
@@ -429,9 +562,7 @@ class PredictionEvaluatorNode(Node):
     def evaluate_prediction_against_known(self, pred: PendingPrediction) -> Optional[EvaluatedPrediction]:
         if not self.enable_known_trajectory_model:
             return None
-
-        circle_start = self.circle_start_ns()
-        if circle_start is None:
+        if not self.has_known_path():
             return None
 
         errs: List[float] = []
@@ -439,16 +570,33 @@ class PredictionEvaluatorNode(Node):
         filtered_stamps: List[int] = []
         filtered_pred_positions: List[np.ndarray] = []
 
+        filtered_pairs: List[Tuple[int, np.ndarray]] = []
         for t_ns, p in zip(pred.pose_stamps_ns, pred.positions):
-            if t_ns < circle_start:
-                continue
-            ref_p = self.known_trajectory_position(t_ns)
-            if ref_p is None:
+            filtered_pairs.append((t_ns, p.copy()))
+
+        if len(filtered_pairs) < 2:
+            return None
+
+        if self.known_path_has_time():
+            for t_ns, p in filtered_pairs:
+                ref_p = self.known_path_position_at_time(t_ns)
+                if ref_p is None:
+                    return None
+                filtered_stamps.append(t_ns)
+                filtered_pred_positions.append(p)
+                model_positions.append(ref_p.copy())
+                errs.append(float(np.linalg.norm(p - ref_p)))
+        else:
+            start_idx = self.nearest_known_path_index(filtered_pairs[0][1])
+            if start_idx is None:
                 return None
-            filtered_stamps.append(t_ns)
-            filtered_pred_positions.append(p.copy())
-            model_positions.append(ref_p.copy())
-            errs.append(float(np.linalg.norm(p - ref_p)))
+            for rel_idx, (t_ns, p) in enumerate(filtered_pairs):
+                ref_idx = min(start_idx + rel_idx, len(self.known_path_positions) - 1)
+                ref_p = self.known_path_positions[ref_idx]
+                filtered_stamps.append(t_ns)
+                filtered_pred_positions.append(p)
+                model_positions.append(ref_p.copy())
+                errs.append(float(np.linalg.norm(p - ref_p)))
 
         if len(errs) < 2:
             return None
@@ -579,13 +727,16 @@ class PredictionEvaluatorNode(Node):
             'improvement_percent': {},
             'known_trajectory_model': {},
             'ground_truth_vs_known_trajectory': {},
+            'anees_3d_position': {},
             'rviz_topics': {
                 'predicted_trajectory': self.proposed_path_topic,
+                'odometry_estimate': self.estimate_odom_topic,
             },
             'artifacts': {
                 'json': self.output_json_path,
                 'plot': self.output_plot_path,
                 'xy_plot': self.output_xy_plot_path,
+                'xyz_plot': self.output_xyz_plot_path,
                 'report': self.output_report_path,
                 'csv': self.output_csv_path,
             },
@@ -620,6 +771,17 @@ class PredictionEvaluatorNode(Node):
                     'mean_error_m': self.gt_model_error_sum / self.gt_model_error_count,
                     'max_error_m': self.gt_model_error_max,
                 }
+
+        if self.anees_count > 0:
+            out['anees_3d_position'] = {
+                'count': self.anees_count,
+                'mean': self.anees_sum / self.anees_count,
+                'max': self.anees_max,
+                'expected': 3.0,
+                'estimate_messages': self.estimate_msg_count,
+                'gt_unmatched_count': self.anees_unmatched_count,
+                'stamp_tolerance_sec': self.anees_stamp_tolerance_ns / 1e9,
+            }
 
         return out
 
@@ -727,7 +889,7 @@ class PredictionEvaluatorNode(Node):
         return steps, means
 
     def add_xy_overlay(self, ax, source: str) -> None:
-        ax.set_title(f'Circular phase: last {source} trajectory (XY)')
+        ax.set_title(f'Last {source} trajectory (XY)')
         ax.set_xlabel('x [m]')
         ax.set_ylabel('y [m]')
         ax.grid(True, alpha=0.25)
@@ -739,13 +901,13 @@ class PredictionEvaluatorNode(Node):
 
         sample = samples[-1]
         if not sample.predicted_positions or not sample.gt_positions:
-            ax.text(0.5, 0.5, f'No valid circular-phase points for {source}', ha='center', va='center', transform=ax.transAxes)
+            ax.text(0.5, 0.5, f'No valid points for {source}', ha='center', va='center', transform=ax.transAxes)
             return
 
         pred = np.vstack(sample.predicted_positions)
         gt = np.vstack(sample.gt_positions)
         ax.plot(pred[:, 0], pred[:, 1], 'o-', label=f'{source} predicted', linewidth=1.8, markersize=3)
-        ax.plot(gt[:, 0], gt[:, 1], 's--', label='ground truth (circular phase)', linewidth=1.8, markersize=4, alpha=0.95)
+        ax.plot(gt[:, 0], gt[:, 1], 's--', label='ground truth', linewidth=1.8, markersize=4, alpha=0.95)
 
         if self.enable_known_trajectory_model and self.evaluated_model_predictions[source]:
             model_sample = self.evaluated_model_predictions[source][-1]
@@ -755,8 +917,8 @@ class PredictionEvaluatorNode(Node):
         ax.legend()
 
     def add_last_error_profile(self, ax, source: str) -> None:
-        ax.set_title(f'Circular phase: last {source} position error over time')
-        ax.set_xlabel('time from circular start [s]')
+        ax.set_title(f'Last {source} position error over time')
+        ax.set_xlabel('time from sample start [s]')
         ax.set_ylabel('error [m]')
         ax.grid(True, alpha=0.25)
 
@@ -778,7 +940,7 @@ class PredictionEvaluatorNode(Node):
         ax.legend()
 
     def add_mean_error_profiles(self, ax) -> None:
-        ax.set_title('Prediction error vs horizon (circular phase)')
+        ax.set_title('Prediction error vs horizon')
         ax.set_xlabel('horizon step')
         ax.set_ylabel('mean error [m]')
         ax.grid(True, alpha=0.25)
@@ -826,7 +988,7 @@ class PredictionEvaluatorNode(Node):
         return steps, means
 
     def add_mean_velocity_error_profiles(self, ax) -> None:
-        ax.set_title('Velocity error vs horizon (circular phase)')
+        ax.set_title('Velocity error vs horizon')
         ax.set_xlabel('horizon step')
         ax.set_ylabel('mean velocity error [m/s]')
         ax.grid(True, alpha=0.25)
@@ -850,40 +1012,27 @@ class PredictionEvaluatorNode(Node):
             ax.text(0.5, 0.5, 'No velocity-error profiles available', ha='center', va='center', transform=ax.transAxes)
 
     def add_radius_over_time(self, ax, source: str) -> None:
-        ax.set_title(f'Circular phase: radius consistency ({source})')
-        ax.set_xlabel('time from circular start [s]')
-        ax.set_ylabel('radius [m]')
+        ax.set_title(f'Known-path tracking error over time ({source})')
+        ax.set_xlabel('time from sample start [s]')
+        ax.set_ylabel('error [m]')
         ax.grid(True, alpha=0.25)
 
-        samples = self.evaluated_predictions[source]
+        samples = self.evaluated_model_predictions[source]
         if not samples:
-            ax.text(0.5, 0.5, f'No {source} samples evaluated', ha='center', va='center', transform=ax.transAxes)
+            ax.text(0.5, 0.5, f'No {source} vs known-path samples evaluated', ha='center', va='center', transform=ax.transAxes)
             return
 
         sample = samples[-1]
-        if not sample.pose_stamps_ns or not sample.predicted_positions or not sample.gt_positions:
-            ax.text(0.5, 0.5, f'No valid circular-phase points for {source}', ha='center', va='center', transform=ax.transAxes)
+        if not sample.pose_stamps_ns or not sample.point_errors_m:
+            ax.text(0.5, 0.5, f'No valid known-path points for {source}', ha='center', va='center', transform=ax.transAxes)
             return
-
-        if self.model_initial_position is None:
-            ax.text(0.5, 0.5, 'Model center unavailable', ha='center', va='center', transform=ax.transAxes)
-            return
-
-        p0 = self.model_initial_position
-        center_x = p0[0] + self.model_initial_offset_x + self.model_circle_radius
-        center_y = p0[1]
 
         t0 = sample.pose_stamps_ns[0]
         times = (np.asarray(sample.pose_stamps_ns, dtype=np.float64) - float(t0)) / 1e9
-        pred = np.vstack(sample.predicted_positions)
-        gt = np.vstack(sample.gt_positions)
-
-        pred_r = np.sqrt((pred[:, 0] - center_x) ** 2 + (pred[:, 1] - center_y) ** 2)
-        gt_r = np.sqrt((gt[:, 0] - center_x) ** 2 + (gt[:, 1] - center_y) ** 2)
-
-        ax.plot(times, gt_r, label='ground truth radius', color='tab:green', linewidth=1.8)
-        ax.plot(times, pred_r, label=f'{source} predicted radius', color='tab:red', linewidth=1.8)
-        ax.axhline(self.model_circle_radius, color='tab:gray', linestyle='--', label='known circle radius')
+        ax.plot(times, sample.point_errors_m, label=f'{source} vs known path', color='tab:red', linewidth=1.8)
+        ax.axhline(sample.ade_m, color='tab:blue', linestyle='--', label=f'ADE={sample.ade_m:.3f}m')
+        ax.axhline(sample.position_rmse_m, color='tab:purple', linestyle='-.', label=f'RMSE={sample.position_rmse_m:.3f}m')
+        ax.axhline(sample.fde_m, color='tab:green', linestyle=':', label=f'FDE={sample.fde_m:.3f}m')
         ax.legend()
 
     def add_summary_panel(self, ax) -> None:
@@ -928,6 +1077,18 @@ class PredictionEvaluatorNode(Node):
                 f"GT vs model max error : {self.format_metric(float(gt_model.get('max_error_m', float('nan'))))} m",
             ])
 
+        anees = summary.get('anees_3d_position', {})
+        if isinstance(anees, dict) and anees:
+            lines.extend([
+                '',
+                f"ANEES 3D (pos) mean: {self.format_metric(float(anees.get('mean', float('nan'))))}",
+                f"ANEES 3D (pos) max : {self.format_metric(float(anees.get('max', float('nan'))))}",
+                f"ANEES expected value: {self.format_metric(float(anees.get('expected', float('nan'))))}",
+                f"ANEES samples used  : {int(anees.get('count', 0))}",
+                f"Estimate odom msgs  : {int(anees.get('estimate_messages', 0))}",
+                f"GT unmatched samples: {int(anees.get('gt_unmatched_count', 0))}",
+            ])
+
         ax.text(0.02, 0.98, '\n'.join(lines), ha='left', va='top', family='monospace', fontsize=9)
 
     def write_plot(self) -> None:
@@ -940,7 +1101,7 @@ class PredictionEvaluatorNode(Node):
             self.add_mean_error_profiles(axes[1, 0])
             self.add_mean_velocity_error_profiles(axes[1, 1])
             self.add_summary_panel(axes[1, 2])
-            fig.suptitle('Prediction quality report (circular phase only)', fontsize=14)
+            fig.suptitle('Prediction quality report', fontsize=14)
             fig.tight_layout()
             fig.savefig(self.output_plot_path, dpi=180, bbox_inches='tight')
             plt.close(fig)
@@ -948,16 +1109,12 @@ class PredictionEvaluatorNode(Node):
             self.get_logger().warn(f'Failed writing plot: {exc}')
             self.get_logger().warn(traceback.format_exc())
 
-    def add_known_circle(self, ax) -> bool:
-        if self.model_initial_position is None:
+    def add_known_path_xy(self, ax) -> bool:
+        if not self.known_path_positions:
             return False
 
-        center_x = self.model_initial_position[0] + self.model_initial_offset_x + self.model_circle_radius
-        center_y = self.model_initial_position[1]
-        theta = np.linspace(0.0, 2.0 * np.pi, 360)
-        x = center_x - self.model_circle_radius * np.cos(theta)
-        y = center_y + self.model_circle_radius * np.sin(theta)
-        ax.plot(x, y, color='tab:green', linestyle='--', linewidth=2.0, label='known circular trajectory')
+        ref = np.vstack(self.known_path_positions)
+        ax.plot(ref[:, 0], ref[:, 1], color='tab:green', linestyle='--', linewidth=2.0, label='known trajectory input')
         return True
 
     def add_prediction_cloud_xy(self, ax, source: str, color: str) -> None:
@@ -1002,24 +1159,63 @@ class PredictionEvaluatorNode(Node):
             fig, ax = plt.subplots(1, 1, figsize=(10, 8))
 
             source = 'proposed'
-            ax.set_title('Circular XY comparison (proposed only)')
+            ax.set_title('XY comparison (proposed only)')
             ax.set_xlabel('x [m]')
             ax.set_ylabel('y [m]')
             ax.grid(True, alpha=0.25)
-            circle_ok = self.add_known_circle(ax)
+            ref_ok = self.add_known_path_xy(ax)
             self.add_prediction_cloud_xy(ax, source, 'tab:red')
             self.add_observer_markers(ax)
-            if not circle_ok and not self.evaluated_predictions[source]:
-                ax.text(0.5, 0.5, 'No circular-phase data available', ha='center', va='center', transform=ax.transAxes)
+            if not ref_ok and not self.evaluated_predictions[source]:
+                ax.text(0.5, 0.5, 'No known-path or prediction data available', ha='center', va='center', transform=ax.transAxes)
             ax.set_aspect('equal', adjustable='box')
             ax.legend(loc='best')
 
-            fig.suptitle('Known circular trajectory vs predicted trajectories (proposed)', fontsize=14)
+            fig.suptitle('Known trajectory input vs predicted trajectories (proposed, XY)', fontsize=14)
             fig.tight_layout()
             fig.savefig(self.output_xy_plot_path, dpi=180, bbox_inches='tight')
             plt.close(fig)
         except Exception as exc:
             self.get_logger().warn(f'Failed writing XY comparison plot: {exc}')
+            self.get_logger().warn(traceback.format_exc())
+
+    def write_xyz_plot(self) -> None:
+        try:
+            self.ensure_parent_dir(self.output_xyz_plot_path)
+            fig = plt.figure(figsize=(10, 8))
+            ax = fig.add_subplot(111, projection='3d')
+
+            source = 'proposed'
+            ax.set_title('Known trajectory input vs predicted trajectories (proposed, XYZ)')
+            ax.set_xlabel('y [m] (swapped)')
+            ax.set_ylabel('x [m] (swapped)')
+            ax.set_zlabel('z [m]')
+
+            if self.known_path_positions:
+                ref = np.vstack(self.known_path_positions)
+                ax.plot(ref[:, 1], ref[:, 0], ref[:, 2], color='tab:green', linestyle='--', linewidth=2.0, label='known trajectory input')
+
+            samples = self.evaluated_predictions[source]
+            for idx, sample in enumerate(samples):
+                if not sample.predicted_positions:
+                    continue
+                pred = np.vstack(sample.predicted_positions)
+                label = 'proposed predictions' if idx == 0 else None
+                ax.plot(pred[:, 1], pred[:, 0], pred[:, 2], color='tab:red', alpha=0.14, linewidth=1.0, label=label)
+
+            if samples and samples[-1].predicted_positions:
+                pred_last = np.vstack(samples[-1].predicted_positions)
+                ax.plot(pred_last[:, 1], pred_last[:, 0], pred_last[:, 2], color='tab:red', linewidth=2.2, label='proposed last prediction')
+
+            if not self.known_path_positions and not samples:
+                ax.text2D(0.35, 0.5, 'No known-path or prediction data available', transform=ax.transAxes)
+
+            ax.legend(loc='best')
+            fig.tight_layout()
+            fig.savefig(self.output_xyz_plot_path, dpi=180, bbox_inches='tight')
+            plt.close(fig)
+        except Exception as exc:
+            self.get_logger().warn(f'Failed writing XYZ comparison plot: {exc}')
             self.get_logger().warn(traceback.format_exc())
 
     def build_worst_samples_table(
@@ -1114,6 +1310,17 @@ class PredictionEvaluatorNode(Node):
                     '',
                 ])
 
+            anees = summary.get('anees_3d_position', {})
+            if isinstance(anees, dict) and anees:
+                lines.extend([
+                    '## ANEES consistency (3D position)',
+                    '',
+                    '| samples | ANEES mean | ANEES max | expected value | estimate msgs | unmatched GT | tol [s] |',
+                    '| ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+                    f"| {int(anees.get('count', 0))} | {self.format_metric(float(anees.get('mean', float('nan'))))} | {self.format_metric(float(anees.get('max', float('nan'))))} | {self.format_metric(float(anees.get('expected', float('nan'))))} | {int(anees.get('estimate_messages', 0))} | {int(anees.get('gt_unmatched_count', 0))} | {self.format_metric(float(anees.get('stamp_tolerance_sec', float('nan'))))} |",
+                    '',
+                ])
+
             lines.extend([
                 '## Worst proposed predictions by ADE (vs GT)',
                 '',
@@ -1123,17 +1330,20 @@ class PredictionEvaluatorNode(Node):
                 '',
                 *self.build_worst_samples_table('baseline', self.evaluated_predictions),
                 '',
-                '> Note: all metrics and plots are computed only on the circular phase of the trajectory.',
+                '> Note: metrics and plots are computed on all timestamps where prediction and reference can be matched.',
                 '',
                 '## RViz topics',
                 '',
                 f"- predicted trajectory: `{self.proposed_path_topic}`",
+                f"- known trajectory input: `{self.known_path_topic}`",
+                f"- estimate odometry: `{self.estimate_odom_topic}`",
                 '',
                 '## Artifacts',
                 '',
                 f'- JSON summary: `{self.output_json_path}`',
                 f'- Plot PNG: `{self.output_plot_path}`',
                 f'- XY comparison PNG: `{self.output_xy_plot_path}`',
+                f'- XYZ comparison PNG: `{self.output_xyz_plot_path}`',
                 f'- Per-sample CSV: `{self.output_csv_path}`',
             ])
 
@@ -1151,12 +1361,14 @@ class PredictionEvaluatorNode(Node):
         self.write_csv_summary()
         self.write_plot()
         self.write_xy_plot()
+        self.write_xyz_plot()
         self.write_report()
 
         self.safe_log_info('Final evaluation artifacts saved:')
         self.safe_log_info(f'  JSON: {self.output_json_path}')
         self.safe_log_info(f'  PNG : {self.output_plot_path}')
         self.safe_log_info(f'  XY  : {self.output_xy_plot_path}')
+        self.safe_log_info(f'  XYZ : {self.output_xyz_plot_path}')
         self.safe_log_info(f'  CSV : {self.output_csv_path}')
         self.safe_log_info(f'  MD  : {self.output_report_path}')
 
