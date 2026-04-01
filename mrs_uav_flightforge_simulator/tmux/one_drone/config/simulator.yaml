@@ -64,6 +64,14 @@ mrs_uav_flightforge_simulator:
       height: 720 # [px]
       fov: 90.32 # [deg]
 
+  ## TODO
+  # baseline and knowledge about it
+  # focal length, depending on FOV and resolution
+  # Accuracy of the detection, how accurate it estimates center of the object
+  #model the triangulation confidence 
+
+
+
       enable_hdr: false
       enable_temporal_aa: false
       enable_raytracing: false

@@ -1,0 +1,65 @@
+{
+  "proposed": {
+    "count": 987,
+    "ade_m": 0.11108905097150658,
+    "fde_m": 0.16087921900156918,
+    "max_error_m": 0.16660821998524442,
+    "position_rmse_m": 0.1362763893757022,
+    "velocity_rmse_m": 0.2040385605433581
+  },
+  "baseline": {
+    "count": 0,
+    "ade_m": null,
+    "fde_m": null,
+    "max_error_m": null,
+    "position_rmse_m": null,
+    "velocity_rmse_m": null
+  },
+  "improvement_percent": {},
+  "known_trajectory_model": {
+    "proposed": {
+      "count": 979,
+      "ade_m": 0.4532822805654657,
+      "fde_m": 0.8713024746704476,
+      "max_error_m": 0.8801851727616605,
+      "position_rmse_m": 0.6190170462443207,
+      "velocity_rmse_m": 0.20487043437915173
+    },
+    "baseline": {
+      "count": 0,
+      "ade_m": null,
+      "fde_m": null,
+      "max_error_m": null,
+      "position_rmse_m": null,
+      "velocity_rmse_m": null
+    },
+    "improvement_percent": {}
+  },
+  "ground_truth_vs_known_trajectory": {
+    "count": 3262,
+    "mean_error_m": 0.029846272396876674,
+    "max_error_m": 0.18068272609624472
+  },
+  "anees_3d_position": {
+    "count": 3406,
+    "mean": 1.0999271454272734,
+    "max": 8.46584735179569,
+    "expected": 3.0,
+    "estimate_messages": 1101,
+    "gt_unmatched_count": 17,
+    "stamp_tolerance_sec": 0.15
+  },
+  "rviz_topics": {
+    "predicted_trajectory": "/target/predicted_trajectory",
+    "odometry_estimate": "/target/odometry_estimate"
+  },
+  "artifacts": {
+    "json": "/home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/debug/evaluation/20260331_175605/prediction_eval.json",
+    "plot": "/home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/debug/evaluation/20260331_175605/prediction_eval_plot.png",
+    "xy_plot": "/home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/debug/evaluation/20260331_175605/prediction_eval_xy.png",
+    "xyz_plot": "/home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/debug/evaluation/20260331_175605/prediction_eval_xyz.png",
+    "distance_plot": "/home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/debug/evaluation/20260331_175605/prediction_eval_distance.png",
+    "report": "/home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/debug/evaluation/20260331_175605/prediction_eval_report.md",
+    "csv": "/home/nello/git/training/mrs_uav_flightforge_simulator/tmux/one_drone/debug/evaluation/20260331_175605/prediction_eval_samples.csv"
+  }
+}

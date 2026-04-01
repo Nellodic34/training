@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Point, PoseStamped, Vector3Stamped
+from geometry_msgs.msg import Point, PointStamped, PoseStamped, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
 from visualization_msgs.msg import Marker, MarkerArray
 from rclpy.duration import Duration
@@ -391,6 +391,7 @@ class TestYolov8MultiViewTriangulationNode(Node):
         self.declare_parameter('pose_topic', '/target/pose_estimate')
         self.declare_parameter('odometry_topic', '/target/odometry_estimate')
         self.declare_parameter('estimated_position_topic', '/target/position_estimate')
+        self.declare_parameter('triangulation_raw_topic', '/target/triangulation_raw')
         self.declare_parameter('error_vector_topic', '/target/position_error')
         self.declare_parameter('target_frame_id', 'world')
         self.declare_parameter(
@@ -442,6 +443,7 @@ class TestYolov8MultiViewTriangulationNode(Node):
         self.pose_topic = str(self.get_parameter('pose_topic').value)
         self.odometry_topic = str(self.get_parameter('odometry_topic').value)
         self.estimated_position_topic = str(self.get_parameter('estimated_position_topic').value)
+        self.triangulation_raw_topic = str(self.get_parameter('triangulation_raw_topic').value)
         self.error_vector_topic = str(self.get_parameter('error_vector_topic').value)
         self.target_frame_id = str(self.get_parameter('target_frame_id').value)
         self.model_path = os.path.expanduser(str(self.get_parameter('model_path').value))
@@ -521,6 +523,7 @@ class TestYolov8MultiViewTriangulationNode(Node):
         self.pose_pub = self.create_publisher(PoseStamped, self.pose_topic, 10)
         self.odometry_pub = self.create_publisher(Odometry, self.odometry_topic, 10)
         self.estimated_position_pub = self.create_publisher(Vector3Stamped, self.estimated_position_topic, 10)
+        self.triangulation_raw_pub = self.create_publisher(PointStamped, self.triangulation_raw_topic, 10)
         self.error_vector_pub = self.create_publisher(Vector3Stamped, self.error_vector_topic, 10)
         self.predicted_trajectory_pub = self.create_publisher(Path, '/target/predicted_trajectory', 10)
         self.trajectory_markers_pub = self.create_publisher(MarkerArray, '/target/predicted_trajectory_markers', 10)
@@ -730,6 +733,16 @@ class TestYolov8MultiViewTriangulationNode(Node):
 
         stamp_ns = max(obs1.stamp_ns, obs2.stamp_ns)
         measurement = midpoint
+
+        # Publish raw triangulation before filtering
+        raw_msg = PointStamped()
+        raw_msg.header.frame_id = self.target_frame_id
+        raw_msg.header.stamp.sec = stamp_ns // 1_000_000_000
+        raw_msg.header.stamp.nanosec = stamp_ns % 1_000_000_000
+        raw_msg.point.x = float(midpoint[0])
+        raw_msg.point.y = float(midpoint[1])
+        raw_msg.point.z = float(midpoint[2])
+        self.triangulation_raw_pub.publish(raw_msg)
 
         # --- Adaptive Measurement Covariance ---
         # Calculate angle between the two rays to scale depth uncertainty

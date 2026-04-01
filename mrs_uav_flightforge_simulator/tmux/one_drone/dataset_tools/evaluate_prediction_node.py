@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import bisect
 import csv
 import json
 import math
@@ -14,7 +15,9 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import rclpy
+from geometry_msgs.msg import PointStamped
 from nav_msgs.msg import Odometry, Path
+import rclpy.executors as rclpy_executors
 from rclpy.node import Node
 
 
@@ -32,6 +35,7 @@ class PendingPrediction:
     created_ns: int
     pose_stamps_ns: List[int]
     positions: List[np.ndarray]
+    observer_positions_at_creation: Dict[str, Optional[np.ndarray]]
 
 
 @dataclass
@@ -48,6 +52,7 @@ class EvaluatedPrediction:
     max_error_m: float
     position_rmse_m: float
     velocity_rmse_m: float
+    distance_to_observers_m: float
 
 
 class PredictionEvaluatorNode(Node):
@@ -59,8 +64,8 @@ class PredictionEvaluatorNode(Node):
         self.declare_parameter('gt_odom_topic', '/uav3/hw_api/ground_truth')
         self.declare_parameter('proposed_path_topic', '/target/predicted_trajectory')
         self.declare_parameter('baseline_path_topic', '')
-        self.declare_parameter('stamp_tolerance_sec', 0.08)
-        self.declare_parameter('anees_stamp_tolerance_sec', 0.10)
+        self.declare_parameter('stamp_tolerance_sec', 0.10)
+        self.declare_parameter('anees_stamp_tolerance_sec', 0.15)
         self.declare_parameter('max_pending_age_sec', 6.0)
         self.declare_parameter('report_every_n_paths', 25)
         self.declare_parameter('output_dir', str(default_output_dir))
@@ -68,10 +73,12 @@ class PredictionEvaluatorNode(Node):
         self.declare_parameter('output_plot_path', '')
         self.declare_parameter('output_xy_plot_path', '')
         self.declare_parameter('output_xyz_plot_path', '')
+        self.declare_parameter('output_distance_plot_path', '')
         self.declare_parameter('output_report_path', '')
         self.declare_parameter('output_csv_path', '')
         self.declare_parameter('known_path_topic', '/target/known_trajectory_path')
         self.declare_parameter('estimate_odom_topic', '/target/odometry_estimate')
+        self.declare_parameter('raw_triangulation_topic', '/target/triangulation_raw')
 
         self.declare_parameter('enable_known_trajectory_model', True)
         self.declare_parameter('model_initial_offset_x', 3.0)
@@ -83,6 +90,8 @@ class PredictionEvaluatorNode(Node):
         self.declare_parameter('plot_observer_markers', True)
         self.declare_parameter('observer1_odom_topic', '/uav1/hw_api/ground_truth')
         self.declare_parameter('observer2_odom_topic', '/uav2/hw_api/ground_truth')
+        self.declare_parameter('plot_historical_alpha', 0.35)
+        self.declare_parameter('plot_historical_linewidth', 1.0)
 
         self.gt_odom_topic = str(self.get_parameter('gt_odom_topic').value)
         self.proposed_path_topic = str(self.get_parameter('proposed_path_topic').value)
@@ -102,6 +111,8 @@ class PredictionEvaluatorNode(Node):
         self.plot_observer_markers = bool(self.get_parameter('plot_observer_markers').value)
         self.observer1_odom_topic = str(self.get_parameter('observer1_odom_topic').value)
         self.observer2_odom_topic = str(self.get_parameter('observer2_odom_topic').value)
+        self.plot_historical_alpha = float(self.get_parameter('plot_historical_alpha').value)
+        self.plot_historical_linewidth = float(self.get_parameter('plot_historical_linewidth').value)
 
         output_dir_value = str(self.get_parameter('output_dir').value).strip()
         self.output_dir = FsPath(output_dir_value) if output_dir_value else default_output_dir
@@ -117,10 +128,12 @@ class PredictionEvaluatorNode(Node):
         self.output_plot_path = str(self.get_parameter('output_plot_path').value) or f'{json_stem}_plot.png'
         self.output_xy_plot_path = str(self.get_parameter('output_xy_plot_path').value) or f'{json_stem}_xy.png'
         self.output_xyz_plot_path = str(self.get_parameter('output_xyz_plot_path').value) or f'{json_stem}_xyz.png'
+        self.output_distance_plot_path = str(self.get_parameter('output_distance_plot_path').value) or f'{json_stem}_distance.png'
         self.output_report_path = str(self.get_parameter('output_report_path').value) or f'{json_stem}_report.md'
         self.output_csv_path = str(self.get_parameter('output_csv_path').value) or f'{json_stem}_samples.csv'
         self.known_path_topic = str(self.get_parameter('known_path_topic').value)
         self.estimate_odom_topic = str(self.get_parameter('estimate_odom_topic').value)
+        self.raw_triangulation_topic = str(self.get_parameter('raw_triangulation_topic').value)
 
         self.gt_history: Dict[int, np.ndarray] = {}
         self.pending: List[PendingPrediction] = []
@@ -177,8 +190,10 @@ class PredictionEvaluatorNode(Node):
         self.model_initial_position: Optional[np.ndarray] = None
         self.model_frame_id: str = ''
         self.gt_velocity_history: Dict[int, np.ndarray] = {}
+        self.gt_timestamps_ns: List[int] = []
         self.estimate_position_history: Dict[int, np.ndarray] = {}
         self.estimate_cov_history: Dict[int, np.ndarray] = {}
+        self.estimate_timestamps_ns: List[int] = []
         self.known_path_stamps_ns: List[int] = []
         self.known_path_positions: List[np.ndarray] = []
         self.observer_positions: Dict[str, Optional[np.ndarray]] = {'observer1': None, 'observer2': None}
@@ -190,10 +205,14 @@ class PredictionEvaluatorNode(Node):
         self.anees_max: float = 0.0
         self.estimate_msg_count: int = 0
         self.anees_unmatched_count: int = 0
+        self.estimation_errors: List[Tuple[float, float]] = []
 
         self.create_subscription(Odometry, self.gt_odom_topic, self.gt_callback, 100)
         if self.estimate_odom_topic.strip():
             self.create_subscription(Odometry, self.estimate_odom_topic, self.estimate_odom_callback, 100)
+        
+        if self.raw_triangulation_topic.strip():
+            self.create_subscription(PointStamped, self.raw_triangulation_topic, self.raw_triangulation_callback, 100)
         self.create_subscription(Path, self.proposed_path_topic, self.proposed_path_callback, 20)
         if self.baseline_path_topic.strip():
             self.create_subscription(Path, self.baseline_path_topic, self.baseline_path_callback, 20)
@@ -216,6 +235,9 @@ class PredictionEvaluatorNode(Node):
                 )
 
         self.create_timer(1.0, self.periodic_report)
+        self.create_timer(0.5, self.timer_evaluate_pending)
+
+        self.last_gt_ns: Optional[int] = None
 
         self.get_logger().info(f'GT topic: {self.gt_odom_topic}')
         self.get_logger().info(f'Proposed path topic: {self.proposed_path_topic}')
@@ -229,6 +251,7 @@ class PredictionEvaluatorNode(Node):
         self.get_logger().info(f'Saving final plot to: {self.output_plot_path}')
         self.get_logger().info(f'Saving XY comparison plot to: {self.output_xy_plot_path}')
         self.get_logger().info(f'Saving XYZ comparison plot to: {self.output_xyz_plot_path}')
+        self.get_logger().info(f'Saving Distance error plot to: {self.output_distance_plot_path}')
         self.get_logger().info(f'Saving final report to: {self.output_report_path}')
         self.get_logger().info(f'Saving per-sample CSV to: {self.output_csv_path}')
         self.get_logger().info(f'Known trajectory input topic: {self.known_path_topic}')
@@ -250,25 +273,45 @@ class PredictionEvaluatorNode(Node):
         t_ns = stamp_to_ns(msg.header.stamp)
         pos = vec3_from_pose(msg.pose.pose)
         self.estimate_msg_count += 1
+        had_stamp = t_ns in self.estimate_position_history
 
         cov = np.asarray(msg.pose.covariance, dtype=np.float64).reshape(6, 6)
         cov_pos = cov[:3, :3].copy()
 
         self.estimate_position_history[t_ns] = pos
         self.estimate_cov_history[t_ns] = cov_pos
+        if not self.estimate_timestamps_ns or t_ns > self.estimate_timestamps_ns[-1]:
+            self.estimate_timestamps_ns.append(t_ns)
+        elif not had_stamp:
+            bisect.insort(self.estimate_timestamps_ns, t_ns)
 
         if len(self.estimate_position_history) > 20000:
             keys = sorted(self.estimate_position_history.keys())
             for k in keys[:5000]:
                 self.estimate_position_history.pop(k, None)
                 self.estimate_cov_history.pop(k, None)
+            self.estimate_timestamps_ns = [k for k in self.estimate_timestamps_ns if k in self.estimate_position_history]
+
+    def nearest_timestamp(self, stamps_ns: List[int], target_ns: int) -> Optional[int]:
+        if not stamps_ns:
+            return None
+        idx = bisect.bisect_left(stamps_ns, target_ns)
+        candidates: List[int] = []
+        if idx < len(stamps_ns):
+            candidates.append(stamps_ns[idx])
+        if idx > 0:
+            candidates.append(stamps_ns[idx - 1])
+        if not candidates:
+            return None
+        return min(candidates, key=lambda k: abs(k - target_ns))
 
     def nearest_estimate_state(self, t_ns: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         if not self.estimate_position_history:
             return None
 
-        keys = list(self.estimate_position_history.keys())
-        nearest_k = min(keys, key=lambda k: abs(k - t_ns))
+        nearest_k = self.nearest_timestamp(self.estimate_timestamps_ns, t_ns)
+        if nearest_k is None:
+            return None
         if abs(nearest_k - t_ns) > self.anees_stamp_tolerance_ns:
             return None
 
@@ -408,8 +451,9 @@ class PredictionEvaluatorNode(Node):
     def nearest_gt_velocity(self, t_ns: int) -> Optional[np.ndarray]:
         if not self.gt_velocity_history:
             return None
-        keys = list(self.gt_velocity_history.keys())
-        nearest_k = min(keys, key=lambda k: abs(k - t_ns))
+        nearest_k = self.nearest_timestamp(self.gt_timestamps_ns, t_ns)
+        if nearest_k is None:
+            return None
         if abs(nearest_k - t_ns) > self.stamp_tolerance_ns:
             return None
         return self.gt_velocity_history[nearest_k]
@@ -435,7 +479,11 @@ class PredictionEvaluatorNode(Node):
         return errs
 
     def gt_callback(self, msg: Odometry) -> None:
+        if not np.isfinite(msg.pose.pose.position.x) or not np.isfinite(msg.pose.pose.position.y) or not np.isfinite(msg.pose.pose.position.z):
+            return
         t_ns = stamp_to_ns(msg.header.stamp)
+        self.last_gt_ns = t_ns
+        had_stamp = t_ns in self.gt_history
         gt_position = vec3_from_pose(msg.pose.pose)
         gt_velocity = np.array(
             [
@@ -447,6 +495,10 @@ class PredictionEvaluatorNode(Node):
         )
         self.gt_history[t_ns] = gt_position
         self.gt_velocity_history[t_ns] = gt_velocity
+        if not self.gt_timestamps_ns or t_ns > self.gt_timestamps_ns[-1]:
+            self.gt_timestamps_ns.append(t_ns)
+        elif not had_stamp:
+            bisect.insort(self.gt_timestamps_ns, t_ns)
 
         est_state = self.nearest_estimate_state(t_ns)
         if est_state is not None:
@@ -484,8 +536,25 @@ class PredictionEvaluatorNode(Node):
             for k in keys[:5000]:
                 self.gt_history.pop(k, None)
                 self.gt_velocity_history.pop(k, None)
+            self.gt_timestamps_ns = [k for k in self.gt_timestamps_ns if k in self.gt_history]
 
-        self.try_evaluate_pending(current_gt_ns=t_ns)
+        # self.try_evaluate_pending(current_gt_ns=t_ns) moved to timer
+
+    def raw_triangulation_callback(self, msg: PointStamped) -> None:
+        t_ns = stamp_to_ns(msg.header.stamp)
+        raw_pos = np.array([msg.point.x, msg.point.y, msg.point.z])
+        
+        # Match with GT
+        gt_pos = self.nearest_gt_position(t_ns)
+        if gt_pos is not None:
+            error = float(np.linalg.norm(raw_pos - gt_pos))
+            obs_positions = [pos for pos in self.observer_positions.values() if pos is not None]
+            if obs_positions:
+                centroid = np.mean(obs_positions, axis=0)
+                dist_to_obs = float(np.linalg.norm(gt_pos - centroid))
+            else:
+                dist_to_obs = float(np.linalg.norm(gt_pos))
+            self.estimation_errors.append((dist_to_obs, error))
 
     def proposed_path_callback(self, msg: Path) -> None:
         self.enqueue_prediction(msg, 'proposed')
@@ -501,12 +570,23 @@ class PredictionEvaluatorNode(Node):
         stamps = [stamp_to_ns(p.header.stamp) for p in poses]
         positions = [vec3_from_pose(p.pose) for p in poses]
 
+        finite_indices = [i for i, p in enumerate(positions) if np.all(np.isfinite(p))]
+        if len(finite_indices) < len(positions):
+            self.get_logger().debug(f"Dropped {len(positions) - len(finite_indices)} non-finite points from {source} path message")
+        
+        if len(finite_indices) < 2:
+            return
+
+        stamps = [stamps[i] for i in finite_indices]
+        positions = [positions[i] for i in finite_indices]
+
         self.pending.append(
             PendingPrediction(
                 source=source,
                 created_ns=stamp_to_ns(path_msg.header.stamp),
                 pose_stamps_ns=stamps,
                 positions=positions,
+                observer_positions_at_creation={k: (v.copy() if v is not None else None) for k, v in self.observer_positions.items()},
             )
         )
 
@@ -514,8 +594,9 @@ class PredictionEvaluatorNode(Node):
         if not self.gt_history:
             return None
 
-        keys = list(self.gt_history.keys())
-        nearest_k = min(keys, key=lambda k: abs(k - t_ns))
+        nearest_k = self.nearest_timestamp(self.gt_timestamps_ns, t_ns)
+        if nearest_k is None:
+            return None
         if abs(nearest_k - t_ns) > self.stamp_tolerance_ns:
             return None
         return self.gt_history[nearest_k]
@@ -529,6 +610,7 @@ class PredictionEvaluatorNode(Node):
         for t_ns, p in zip(pred.pose_stamps_ns, pred.positions):
             gt_p = self.nearest_gt_position(t_ns)
             if gt_p is None:
+                self.get_logger().debug(f'Evaluation failed: no GT for stamp {t_ns} (tolerance {self.stamp_tolerance_ns}ns)')
                 return None
             filtered_stamps.append(t_ns)
             filtered_pred_positions.append(p.copy())
@@ -539,6 +621,13 @@ class PredictionEvaluatorNode(Node):
             return None
 
         vel_errs = self.velocity_errors(filtered_stamps, filtered_pred_positions)
+
+        obs_positions = [pos for pos in pred.observer_positions_at_creation.values() if pos is not None]
+        if obs_positions:
+            centroid = np.mean(obs_positions, axis=0)
+            dist_to_obs = float(np.linalg.norm(filtered_pred_positions[0] - centroid))
+        else:
+            dist_to_obs = float(np.linalg.norm(filtered_pred_positions[0]))
 
         ade = float(np.mean(errs))
         fde = float(errs[-1])
@@ -557,6 +646,7 @@ class PredictionEvaluatorNode(Node):
             max_error_m=float(max(errs)),
             position_rmse_m=pos_rmse,
             velocity_rmse_m=vel_rmse,
+            distance_to_observers_m=dist_to_obs,
         )
 
     def evaluate_prediction_against_known(self, pred: PendingPrediction) -> Optional[EvaluatedPrediction]:
@@ -603,6 +693,13 @@ class PredictionEvaluatorNode(Node):
 
         vel_errs = self.velocity_errors(filtered_stamps, filtered_pred_positions)
 
+        obs_positions = [pos for pos in pred.observer_positions_at_creation.values() if pos is not None]
+        if obs_positions:
+            centroid = np.mean(obs_positions, axis=0)
+            dist_to_obs = float(np.linalg.norm(filtered_pred_positions[0] - centroid))
+        else:
+            dist_to_obs = float(np.linalg.norm(filtered_pred_positions[0]))
+
         ade = float(np.mean(errs))
         fde = float(errs[-1])
         pos_rmse = float(np.sqrt(np.mean(np.square(np.asarray(errs, dtype=np.float64)))))
@@ -620,6 +717,7 @@ class PredictionEvaluatorNode(Node):
             max_error_m=float(max(errs)),
             position_rmse_m=pos_rmse,
             velocity_rmse_m=vel_rmse,
+            distance_to_observers_m=dist_to_obs,
         )
 
     def update_metrics(self, metric_store: Dict[str, Dict[str, float]], source: str, result: EvaluatedPrediction) -> None:
@@ -634,6 +732,11 @@ class PredictionEvaluatorNode(Node):
             m['vel_sq_error_sum'] += float(np.sum(np.square(np.asarray(result.velocity_errors_m, dtype=np.float64))))
             m['vel_point_count'] += len(result.velocity_errors_m)
 
+    def timer_evaluate_pending(self) -> None:
+        latest_gt = self.last_gt_ns
+        if latest_gt is not None:
+            self.try_evaluate_pending(current_gt_ns=latest_gt)
+
     def try_evaluate_pending(self, current_gt_ns: int) -> None:
         keep: List[PendingPrediction] = []
 
@@ -646,8 +749,11 @@ class PredictionEvaluatorNode(Node):
             result_gt = self.evaluate_prediction(pred)
             if result_gt is None:
                 # if too old, drop
-                if current_gt_ns - pred.created_ns <= self.max_pending_age_ns:
+                age_ns = current_gt_ns - pred.created_ns
+                if age_ns <= self.max_pending_age_ns:
                     keep.append(pred)
+                else:
+                    self.get_logger().warn(f'Dropped {pred.source} prediction: too old ({age_ns/1e9:.1f}s > {self.max_pending_age_ns/1e9:.1f}s) or evaluation failed')
                 continue
 
             self.evaluated_predictions[pred.source].append(result_gt)
@@ -737,6 +843,7 @@ class PredictionEvaluatorNode(Node):
                 'plot': self.output_plot_path,
                 'xy_plot': self.output_xy_plot_path,
                 'xyz_plot': self.output_xyz_plot_path,
+                'distance_plot': self.output_distance_plot_path,
                 'report': self.output_report_path,
                 'csv': self.output_csv_path,
             },
@@ -793,7 +900,10 @@ class PredictionEvaluatorNode(Node):
 
     def safe_log_info(self, message: str) -> None:
         try:
-            self.get_logger().info(message)
+            if rclpy.ok() and self.get_logger():
+                self.get_logger().info(message)
+            else:
+                print(message, flush=True)
         except Exception:
             print(message, flush=True)
 
@@ -1091,6 +1201,145 @@ class PredictionEvaluatorNode(Node):
 
         ax.text(0.02, 0.98, '\n'.join(lines), ha='left', va='top', family='monospace', fontsize=9)
 
+    def mean_rmse_over_observer_distance(
+        self,
+        source: str,
+        bins: int = 20,
+        max_distance: Optional[float] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        samples = self.evaluated_predictions[source]
+        valid_samples = [s for s in samples if math.isfinite(s.distance_to_observers_m) and math.isfinite(s.position_rmse_m)]
+
+        if not valid_samples:
+            return np.array([]), np.array([])
+
+        all_max = [s.distance_to_observers_m for s in valid_samples]
+        if not all_max:
+            return np.array([]), np.array([])
+            
+        min_d = min(all_max)
+        max_d = max_distance if max_distance is not None else max(all_max)
+        if max_d <= min_d:
+            if max_d > 0:
+                min_d = 0.0
+            else:
+                return np.array([]), np.array([])
+
+        bin_edges = np.linspace(min_d, max_d, bins + 1)
+        sums = np.zeros(bins)
+        counts = np.zeros(bins)
+
+        for s in valid_samples:
+            d = s.distance_to_observers_m
+            e = s.position_rmse_m
+            idx = np.searchsorted(bin_edges, d) - 1
+            if idx == -1 and d == bin_edges[0]:
+                idx = 0
+            if 0 <= idx < bins:
+                sums[idx] += e
+                counts[idx] += 1
+
+        valid = counts > 0
+        centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        return centers[valid], (sums[valid] / counts[valid])
+
+    def mean_estimation_error_over_distance(
+        self,
+        bins: int = 20,
+        max_distance: Optional[float] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if not self.estimation_errors:
+            return np.array([]), np.array([])
+        
+        all_dist = [e[0] for e in self.estimation_errors]
+        all_err = [e[1] for e in self.estimation_errors]
+        
+        min_d = min(all_dist)
+        max_d = max_distance if max_distance is not None else max(all_dist)
+        if max_d <= min_d:
+            return np.array([]), np.array([])
+            
+        bin_edges = np.linspace(min_d, max_d, bins + 1)
+        sums = np.zeros(bins)
+        counts = np.zeros(bins)
+        
+        for d, e in zip(all_dist, all_err):
+            edges = np.array(bin_edges)
+            idx = int(np.searchsorted(edges, d) - 1)
+            if idx == -1 and d == edges[0]:
+                idx = 0
+            if 0 <= idx < bins:
+                sums[idx] += e**2
+                counts[idx] += 1
+                
+        valid = counts > 0
+        centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        return centers[valid], np.sqrt(sums[valid] / counts[valid])
+
+    def add_estimation_error_plot(self, ax) -> None:
+        ax.set_title('Estimation Accuracy (Pose/Triangulation)')
+        ax.set_xlabel('distance from observers [m]')
+        ax.set_ylabel('pose estimation RMSE [m]')
+        ax.grid(True, alpha=0.25)
+        
+        if self.estimation_errors:
+            # Plot raw scatter points with low alpha
+            all_dist = [e[0] for e in self.estimation_errors]
+            all_err = [e[1] for e in self.estimation_errors]
+            ax.scatter(all_dist, all_err, color='tab:green', alpha=0.1, s=1, label='raw estimation error')
+
+        d, e = self.mean_estimation_error_over_distance(bins=50)
+        if d.size > 0:
+            ax.plot(d, e, label='estimation RMSE (50 bins)', color='tab:green', linewidth=1.5)
+            # Filter for finite values to avoid numpy errors/warnings
+            finite_errs = [err[1] for err in self.estimation_errors if np.isfinite(err[1])]
+            if finite_errs:
+                mean_sq_total = float(np.mean(np.square(finite_errs)))
+                rmse_total = np.sqrt(mean_sq_total)
+                ax.axhline(rmse_total, color='tab:green', linestyle=':', alpha=0.6, label=f'overall RMSE: {rmse_total:.3f}m')
+            ax.legend()
+        else:
+            ax.text(0.5, 0.5, 'No estimation data', ha='center', va='center', transform=ax.transAxes)
+
+    def add_error_vs_distance(self, ax) -> None:
+        ax.set_title('Prediction Accuracy (Future Horizon)')
+        ax.set_xlabel('distance from observers [m]')
+        ax.set_ylabel('mean trajectory RMSE [m]')
+        ax.grid(True, alpha=0.25)
+
+        plotted = False
+        for source, color in (('proposed', 'tab:blue'), ('baseline', 'tab:orange')):
+            d, e = self.mean_rmse_over_observer_distance(source, bins=20)
+            if d.size > 0:
+                ax.plot(d, e, label=f'{source} vs GT', color=color, linewidth=2.0, marker='o', markersize=4)
+                
+                summary = self.source_summary(source, self.metrics)
+                mean_rmse = summary.get('position_rmse_m', float('nan'))
+                if math.isfinite(mean_rmse):
+                    hline_color = 'tab:red' if source == 'proposed' else color
+                    ax.axhline(mean_rmse, color=hline_color, linestyle='--', linewidth=1.5, alpha=0.8, label=f'{source} overall RMSE: {mean_rmse:.3f}m')
+                
+                plotted = True
+
+        if plotted:
+            ax.legend()
+        else:
+            ax.text(0.5, 0.5, 'No valid data', ha='center', va='center', transform=ax.transAxes)
+
+    def write_distance_plot(self) -> None:
+        try:
+            self.ensure_parent_dir(self.output_distance_plot_path)
+            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+            self.add_estimation_error_plot(axes[0])
+            self.add_error_vs_distance(axes[1])
+            fig.suptitle('Accuracy vs Distance from Observers', fontsize=14)
+            fig.tight_layout()
+            fig.savefig(self.output_distance_plot_path, dpi=180, bbox_inches='tight')
+            plt.close(fig)
+        except Exception as exc:
+            self.get_logger().warn(f'Failed writing distance plot: {exc}')
+            self.get_logger().warn(traceback.format_exc())
+
     def write_plot(self) -> None:
         try:
             self.ensure_parent_dir(self.output_plot_path)
@@ -1098,9 +1347,11 @@ class PredictionEvaluatorNode(Node):
             self.add_xy_overlay(axes[0, 0], 'proposed')
             self.add_last_error_profile(axes[0, 1], 'proposed')
             self.add_radius_over_time(axes[0, 2], 'proposed')
+            
             self.add_mean_error_profiles(axes[1, 0])
             self.add_mean_velocity_error_profiles(axes[1, 1])
             self.add_summary_panel(axes[1, 2])
+            
             fig.suptitle('Prediction quality report', fontsize=14)
             fig.tight_layout()
             fig.savefig(self.output_plot_path, dpi=180, bbox_inches='tight')
@@ -1127,7 +1378,7 @@ class PredictionEvaluatorNode(Node):
                 continue
             pred = np.vstack(sample.predicted_positions)
             label = f'{source} predictions' if idx == 0 else None
-            ax.plot(pred[:, 0], pred[:, 1], color=color, alpha=0.14, linewidth=1.0, label=label)
+            ax.plot(pred[:, 0], pred[:, 1], color=color, alpha=self.plot_historical_alpha, linewidth=self.plot_historical_linewidth, label=label)
 
         last = samples[-1]
         if last.predicted_positions:
@@ -1196,16 +1447,17 @@ class PredictionEvaluatorNode(Node):
                 ax.plot(ref[:, 1], ref[:, 0], ref[:, 2], color='tab:green', linestyle='--', linewidth=2.0, label='known trajectory input')
 
             samples = self.evaluated_predictions[source]
+            color = 'tab:red'
             for idx, sample in enumerate(samples):
                 if not sample.predicted_positions:
                     continue
                 pred = np.vstack(sample.predicted_positions)
                 label = 'proposed predictions' if idx == 0 else None
-                ax.plot(pred[:, 1], pred[:, 0], pred[:, 2], color='tab:red', alpha=0.14, linewidth=1.0, label=label)
+                ax.plot(pred[:, 1], pred[:, 0], pred[:, 2], color=color, alpha=self.plot_historical_alpha, linewidth=self.plot_historical_linewidth, label=label)
 
             if samples and samples[-1].predicted_positions:
                 pred_last = np.vstack(samples[-1].predicted_positions)
-                ax.plot(pred_last[:, 1], pred_last[:, 0], pred_last[:, 2], color='tab:red', linewidth=2.2, label='proposed last prediction')
+                ax.plot(pred_last[:, 1], pred_last[:, 0], pred_last[:, 2], color=color, linewidth=2.2, label='proposed last prediction')
 
             if not self.known_path_positions and not samples:
                 ax.text2D(0.35, 0.5, 'No known-path or prediction data available', transform=ax.transAxes)
@@ -1344,6 +1596,7 @@ class PredictionEvaluatorNode(Node):
                 f'- Plot PNG: `{self.output_plot_path}`',
                 f'- XY comparison PNG: `{self.output_xy_plot_path}`',
                 f'- XYZ comparison PNG: `{self.output_xyz_plot_path}`',
+                f'- Distance error PNG: `{self.output_distance_plot_path}`',
                 f'- Per-sample CSV: `{self.output_csv_path}`',
             ])
 
@@ -1360,6 +1613,7 @@ class PredictionEvaluatorNode(Node):
         self.write_json_summary()
         self.write_csv_summary()
         self.write_plot()
+        self.write_distance_plot()
         self.write_xy_plot()
         self.write_xyz_plot()
         self.write_report()
@@ -1367,6 +1621,7 @@ class PredictionEvaluatorNode(Node):
         self.safe_log_info('Final evaluation artifacts saved:')
         self.safe_log_info(f'  JSON: {self.output_json_path}')
         self.safe_log_info(f'  PNG : {self.output_plot_path}')
+        self.safe_log_info(f'  DIST: {self.output_distance_plot_path}')
         self.safe_log_info(f'  XY  : {self.output_xy_plot_path}')
         self.safe_log_info(f'  XYZ : {self.output_xyz_plot_path}')
         self.safe_log_info(f'  CSV : {self.output_csv_path}')
@@ -1384,8 +1639,16 @@ def main() -> None:
     node = PredictionEvaluatorNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, rclpy_executors.ExternalShutdownException):
         pass
+    except Exception as e:
+        # Ignore pybind11/conversion errors that often happen during shutdown race conditions
+        is_shutdown_race = not rclpy.ok() and ("Unable to convert call argument" in str(e) or "pybind11" in str(e))
+        if not is_shutdown_race:
+            if rclpy.ok():
+                node.get_logger().error(f"Unhandled exception in spin(): {str(e)}\n{traceback.format_exc()}")
+            else:
+                print(f"Unhandled exception in spin() after shutdown: {str(e)}\n{traceback.format_exc()}", flush=True)
     finally:
         node.finalize_report()
         try:
