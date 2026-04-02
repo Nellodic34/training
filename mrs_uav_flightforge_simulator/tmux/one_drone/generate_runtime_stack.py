@@ -137,6 +137,50 @@ def build_auto_start_window(node_cfg):
             }
         }
 
+    if auto_start_node == 'decentralized':
+        observer_script = node_cfg['observer_script']
+        main_script = node_cfg['main_triangulation_script']
+        
+        observer_params = {
+            'uav_name': node_cfg['observer2_name']
+        }
+        main_params = {
+            'uav_name': node_cfg['observer1_name'],
+            'observer1_name': node_cfg['observer2_name'],
+            'target_name': node_cfg['target_name'],
+            'kf_process_noise_acc': node_cfg['kf_process_noise_acc'],
+            'kf_measurement_noise': node_cfg['kf_measurement_noise'],
+            'kf_initial_covariance': node_cfg['kf_initial_covariance'],
+        }
+        
+        return {
+            'decentralized': {
+                'layout': 'tiled',
+                'panes': [
+                    build_dataset_tool_command(
+                        workspace_dir,
+                        ros_setup,
+                        local_setup,
+                        venv_activate,
+                        python_bin,
+                        main_script,
+                        'Starting Main Triangulation node...',
+                        main_params,
+                    ),
+                    build_dataset_tool_command(
+                        workspace_dir,
+                        ros_setup,
+                        local_setup,
+                        venv_activate,
+                        python_bin,
+                        observer_script,
+                        'Starting Observer node...',
+                        observer_params,
+                    )
+                ],
+            }
+        }
+
     return {
         'perception_ready': {
             'layout': 'tiled',
@@ -310,9 +354,9 @@ def main() -> int:
     simulation_cfg = runtime_config.get('simulation', {})
     ekf_cfg = runtime_config.get('ekf', {})
 
-    auto_start_node = str(launcher_cfg.get('auto_start_node', 'triangulation')).strip().lower()
-    if auto_start_node not in {'none', 'detection', 'triangulation'}:
-        raise ValueError('launcher.auto_start_node must be one of: none, detection, triangulation')
+    auto_start_node = str(os.environ.get('AUTO_START_NODE_OVERRIDE', launcher_cfg.get('auto_start_node', 'triangulation'))).strip().lower()
+    if auto_start_node not in {'none', 'detection', 'triangulation', 'decentralized'}:
+        raise ValueError('launcher.auto_start_node must be one of: none, detection, triangulation, decentralized')
 
     open_error_plot = bool(launcher_cfg.get('open_error_plot', True))
     plot_delay_sec = int(launcher_cfg.get('plot_delay_sec', 10))
@@ -339,6 +383,14 @@ def main() -> int:
     triangulation_script = os.environ.get(
         'TRIANGULATION_SCRIPT',
         str(script_dir / 'dataset_tools/test_yolov8_multiview_triangulation_node.py'),
+    )
+    observer_script = os.environ.get(
+        'OBSERVER_SCRIPT',
+        str(script_dir / 'dataset_tools/yolov8_observer_node.py'),
+    )
+    main_triangulation_script = os.environ.get(
+        'MAIN_TRIANGULATION_SCRIPT',
+        str(script_dir / 'dataset_tools/yolov8_main_triangulation_node.py'),
     )
 
     drone_count = int(simulation_cfg.get('drone_count', 3))
@@ -372,6 +424,8 @@ def main() -> int:
         'python_bin': python_bin,
         'detection_script': detection_script,
         'triangulation_script': triangulation_script,
+        'observer_script': observer_script,
+        'main_triangulation_script': main_triangulation_script,
         'auto_start_node': auto_start_node,
         'observer1_name': observer1_name,
         'observer2_name': observer2_name,

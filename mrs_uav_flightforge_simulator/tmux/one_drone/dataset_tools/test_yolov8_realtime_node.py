@@ -2,10 +2,12 @@
 
 import os
 import time
+from pathlib import Path
 from typing import List, Tuple
 
 import cv2
 import rclpy
+import yaml
 from cv_bridge import CvBridge
 from rclpy.node import Node
 from sensor_msgs.msg import Image
@@ -16,7 +18,24 @@ class TestYolov8RealtimeNode(Node):
     def __init__(self) -> None:
         super().__init__('test_yolov8_realtime_node')
 
-        self.declare_parameter('input_image_topic', '/uav1/rgb/image_raw')
+        # Load observer name from runtime_stack.yaml
+        script_dir = Path(__file__).resolve().parent
+        config_path = script_dir.parent / 'config' / 'runtime_stack.yaml'
+        observer_name = 'uav1'
+
+        if config_path.exists():
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = yaml.safe_load(f)
+                    if config and 'uav_roles' in config:
+                        observer_name = config['uav_roles'].get('observer1', 'uav1')
+                self.get_logger().info(f'Loaded observer1 name from config: {observer_name}')
+            except Exception as e:
+                self.get_logger().error(f'Failed to load config from {config_path}: {e}')
+        else:
+            self.get_logger().warning(f'Config file not found at {config_path}, defaulting to uav1')
+
+        self.declare_parameter('input_image_topic', f'/{observer_name}/rgb/image_raw')
         self.declare_parameter('output_image_topic', '/test_img')
         self.declare_parameter(
             'model_path',
@@ -26,7 +45,7 @@ class TestYolov8RealtimeNode(Node):
         self.declare_parameter('iou_threshold', 0.45)
         self.declare_parameter('imgsz', 960)
         self.declare_parameter('max_detections', 100)
-        self.declare_parameter('device', 'cpu')
+        self.declare_parameter('device', 'cuda')
         self.declare_parameter('line_width', 2)
 
         self.input_image_topic = str(self.get_parameter('input_image_topic').value)
